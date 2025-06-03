@@ -1045,30 +1045,32 @@ static int umdp_devio_write(struct sk_buff* skb, struct genl_info* info) {
         if (info->attrs[i] == NULL) {
             continue;
         }
-
         switch (nla_type(info->attrs[i])) {
-            case UMDP_ATTR_DEVIO_WRITE_VALUE_U8: {
-                u8 value = *((u8*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u8(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%02x) to port %llu\n", value, value, port);
-                return 0;
-            }
-            case UMDP_ATTR_DEVIO_WRITE_VALUE_U16: {
-                u16 value = *((u16*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u16(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%04x) to port %llu\n", value, value, port);
-                return 0;
-            }
-            case UMDP_ATTR_DEVIO_WRITE_VALUE_U32: {
-                u32 value = *((u32*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u32(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%08x) to port %llu\n", value, value, port);
-                return 0;
-            }
-            default:
-                printk(KERN_ERR "umdp: unknown attribute type %d\n", nla_type(info->attrs[i]));
-                return -EINVAL;
-        }
+    case UMDP_ATTR_DEVIO_WRITE_PORT:
+        // Skip port attribute - already processed above
+        continue;
+    case UMDP_ATTR_DEVIO_WRITE_VALUE_U8: {
+        u8 value = *((u8*) nla_data(info->attrs[i]));
+        riscv_hardware_write_u8(port, value);
+        printk(KERN_DEBUG "umdp: wrote %u (0x%02x) to port %llu\n", value, value, port);
+        return 0;
+    }
+    case UMDP_ATTR_DEVIO_WRITE_VALUE_U16: {
+        u16 value = *((u16*) nla_data(info->attrs[i]));
+        riscv_hardware_write_u16(port, value);
+        printk(KERN_DEBUG "umdp: wrote %u (0x%04x) to port %llu\n", value, value, port);
+        return 0;
+    }
+    case UMDP_ATTR_DEVIO_WRITE_VALUE_U32: {
+        u32 value = *((u32*) nla_data(info->attrs[i]));
+        riscv_hardware_write_u32(port, value);
+        printk(KERN_DEBUG "umdp: wrote %u (0x%08x) to port %llu\n", value, value, port);
+        return 0;
+    }
+    default:
+        printk(KERN_ERR "umdp: unknown attribute type %d\n", nla_type(info->attrs[i]));
+        return -EINVAL;
+    }   
     }
 
     printk(KERN_ERR "umdp: invalid device IO write request: value attribute is missing\n");
