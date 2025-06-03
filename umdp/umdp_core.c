@@ -81,6 +81,7 @@ static void __iomem *gpio1_base = NULL;
 static void __iomem *gpio2_base = NULL;
 static void __iomem *uart0_base = NULL;
 static void __iomem *pwm0_base = NULL;
+static void __iomem *pwm1_base = NULL;  
 
 // Hardware initialization function
 static int umdp_init_hardware(void) {
@@ -114,9 +115,19 @@ static int umdp_init_hardware(void) {
         goto cleanup_uart0;
     }
     
-    printk(KERN_INFO "umdp: successfully mapped hardware - GPIO0, GPIO1, GPIO2, UART0, PWM0\n");
+    pwm1_base = ioremap(0x03061000, 0x1000);  // PWM1 for timer ports
+    if (!pwm1_base) {
+    printk(KERN_ERR "umdp: failed to map PWM1\n");
+    goto cleanup_pwm0;
+    }
+
+    printk(KERN_INFO "umdp: successfully mapped hardware - GPIO0, GPIO1, GPIO2, UART0, PWM0, PWM1\n");
     return 0;
 
+
+cleanup_pwm0:
+    iounmap(pwm0_base);
+    pwm0_base = NULL;
 cleanup_uart0:
     iounmap(uart0_base);
     uart0_base = NULL;
@@ -134,6 +145,10 @@ cleanup_gpio0:
 
 // Hardware cleanup function
 static void umdp_cleanup_hardware(void) {
+    if (pwm1_base) {
+        iounmap(pwm1_base);
+        pwm1_base = NULL;
+    }
     if (pwm0_base) {
         iounmap(pwm0_base);
         pwm0_base = NULL;
@@ -163,6 +178,34 @@ static u8 riscv_hardware_read_u8(u64 port) {
     u8 value;
     
     switch (port) {
+        case 0x40:  // Timer 0 data port -> PWM1 period register
+            if (!pwm1_base) return 0xFF;
+            addr = pwm1_base + 0x04;  // PWM period register
+            value = ioread8(addr);
+            printk(KERN_INFO "umdp: read PWM1[0x04]: 0x%02x (timer port 0x40)\n", value);
+            break;
+    
+        case 0x41:  // Timer 0 data port (high byte) -> PWM1 period high
+            if (!pwm1_base) return 0xFF;
+            addr = pwm1_base + 0x05;
+            value = ioread8(addr);
+            printk(KERN_INFO "umdp: read PWM1[0x05]: 0x%02x (timer port 0x41)\n", value);
+            break;
+    
+        case 0x42:  // Timer 1 data port -> PWM1 duty cycle
+            if (!pwm1_base) return 0xFF;
+            addr = pwm1_base + 0x08;  // PWM duty cycle register
+            value = ioread8(addr);
+            printk(KERN_INFO "umdp: read PWM1[0x08]: 0x%02x (timer port 0x42)\n", value);
+            break;
+    
+        case 0x43:  // Timer control port -> PWM1 control register
+            if (!pwm1_base) return 0xFF;
+            addr = pwm1_base + 0x00;  // PWM control register
+            value = ioread8(addr);
+            printk(KERN_INFO "umdp: read PWM1[0x00]: 0x%02x (timer ctrl port 0x43)\n", value);
+            break;
+
         case 0x60:  // Classic PS/2 keyboard data -> GPIO0 data register
             if (!gpio0_base) return 0xFF;
             addr = gpio0_base + 0x00;
@@ -219,6 +262,19 @@ static void riscv_hardware_write_u8(u64 port, u8 value) {
     void __iomem *addr;
     
     switch (port) {
+        case 0x40:  // Timer 0 data port
+            if (!pwm1_base) return;
+            addr = pwm1_base + 0x04;
+            iowrite8(value, addr);
+            printk(KERN_INFO "umdp: wrote 0x%02x to PWM1[0x04] (timer port 0x40)\n", value);
+            break;
+    
+        case 0x43:  // Timer control port  
+            if (!pwm1_base) return;
+            addr = pwm1_base + 0x00;
+            iowrite8(value, addr);
+            printk(KERN_INFO "umdp: wrote 0x%02x to PWM1[0x00] (timer ctrl port 0x43)\n", value);
+            break;
         case 0x60:  // Classic PS/2 keyboard data -> GPIO0 data register
             if (!gpio0_base) return;
             addr = gpio0_base + 0x00;
