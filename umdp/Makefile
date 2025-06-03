@@ -3,6 +3,9 @@ ifneq ($(KERNELRELEASE),)
 obj-m  := umdp.o
 umdp-y := umdp_core.o umdp_ac.o
 
+
+EXTRA_CFLAGS += -std=gnu11
+
 else
 # normal makefile
 KERNEL_VER ?= `uname -r`

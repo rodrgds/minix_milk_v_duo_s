@@ -4,8 +4,19 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
+#include <linux/ctype.h>
 
 #include "umdp_common.h"
+
+// Add the same krealloc_array_compat function after includes:
+static inline void *krealloc_array_compat(void *p, size_t new_n, size_t size, gfp_t flags)
+{
+    size_t bytes;
+    if (unlikely(check_mul_overflow(new_n, size, &bytes)))
+        return NULL;
+    return krealloc(p, bytes, flags);
+}
 
 struct permission_entry {
     struct list_head list;
@@ -383,8 +394,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
                     }
 
                     allowed_irq_lines_count++;
-                    u32* new_allowed_irq_lines =
-                        krealloc_array(allowed_irq_lines, allowed_irq_lines_count, sizeof(u32), GFP_KERNEL);
+                    u32* new_allowed_irq_lines = krealloc_array_compat(allowed_irq_lines, allowed_irq_lines_count, sizeof(u32), GFP_KERNEL);
                     if (new_allowed_irq_lines == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -494,8 +504,8 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
                     }
 
                     allowed_mmap_regions_count++;
-                    struct mmap_region* new_allowed_mmap_regions = krealloc_array(
-                        allowed_mmap_regions, allowed_mmap_regions_count, sizeof(struct mmap_region), GFP_KERNEL);
+                    struct mmap_region* new_allowed_mmap_regions = krealloc_array_compat(
+                    allowed_mmap_regions, allowed_mmap_regions_count, sizeof(struct mmap_region), GFP_KERNEL);
                     if (new_allowed_mmap_regions == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -611,8 +621,8 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
                     }
 
                     allowed_port_io_regions_count++;
-                    struct port_io_region* new_allowed_port_io_regions = krealloc_array(allowed_port_io_regions,
-                        allowed_port_io_regions_count, sizeof(struct port_io_region), GFP_KERNEL);
+                    struct port_io_region* new_allowed_port_io_regions = krealloc_array_compat(allowed_port_io_regions,
+                    allowed_port_io_regions_count, sizeof(struct port_io_region), GFP_KERNEL);
                     if (new_allowed_port_io_regions == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -645,6 +655,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
                     ret = -EINVAL;
                     goto fail;
                 }
+                fallthrough;
             case PERMTAB_SKIPPING_TO_NEXT_LINE:
                 if (c == '\n') {
                     state = PERMTAB_START;
@@ -658,6 +669,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
             finish_current_entry_and_reset();
             break;
         case PERMTAB_START:
+                fallthrough;
         case PERMTAB_SKIPPING_TO_NEXT_LINE:
             break;
         default:

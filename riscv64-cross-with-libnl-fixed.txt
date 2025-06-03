@@ -1,0 +1,21 @@
+[binaries]
+c = 'riscv64-linux-gnu-gcc'
+cpp = 'riscv64-linux-gnu-g++'
+ar = 'riscv64-linux-gnu-ar'
+strip = 'riscv64-linux-gnu-strip'
+pkg-config = 'pkg-config'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'riscv64'
+cpu = 'riscv64'
+endian = 'little'
+
+[built-in options]
+c_args = ['--sysroot=/home/luhen_39/pi/duo-buildroot-sdk/ramdisk/rootfs/common_musl_riscv64', '-I/home/luhen_39/riscv-libnl-static/include/libnl3']
+c_link_args = ['--sysroot=/home/luhen_39/pi/duo-buildroot-sdk/ramdisk/rootfs/common_musl_riscv64', '-L/home/luhen_39/riscv-libnl-static/lib']
+default_library = 'static'
+
+[properties]
+sys_root = '/home/luhen_39/pi/duo-buildroot-sdk/ramdisk/rootfs/common_musl_riscv64'
+pkg_config_path = '/home/luhen_39/riscv-libnl-static/lib/pkgconfig'

@@ -1,17 +1,13 @@
 #include <linux/cdev.h>
-#include <linux/slab.h>
-#include <linux/mm.h>
-#include <linux/sched/mm.h>
-#include <linux/overflow.h>
 #include <linux/dcache.h>
 #include <linux/fdtable.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/kprobes.h>
 #include <linux/list.h>
+#include <linux/mm.h>
 #include <linux/mm_types.h>
 #include <linux/module.h>
 #include <linux/pid.h>
@@ -63,247 +59,6 @@ enum {
 };
 #define UMDP_ATTR_CONNECT_MAX (__UMDP_ATTR_CONNECT_MAX - 1)
 static_assert(UMDP_ATTR_CONNECT_MAX <= UMDP_ATTR_MAX);
-
-// Add these after the existing includes, before any function definitions:
-
-// Real hardware base addresses from Milk-V Duo S /proc/iomem
-#define GPIO0_BASE_ADDR    0x03020000
-#define GPIO1_BASE_ADDR    0x03021000  
-#define GPIO2_BASE_ADDR    0x03022000
-#define GPIO3_BASE_ADDR    0x03023000
-#define UART0_BASE_ADDR    0x04140000
-#define UART1_BASE_ADDR    0x04150000
-#define PWM0_BASE_ADDR     0x03060000
-
-// MMIO pointers - add these as global variables
-static void __iomem *gpio0_base = NULL;
-static void __iomem *gpio1_base = NULL;
-static void __iomem *gpio2_base = NULL;
-static void __iomem *uart0_base = NULL;
-static void __iomem *pwm0_base = NULL;
-
-// Hardware initialization function
-static int umdp_init_hardware(void) {
-    gpio0_base = ioremap(GPIO0_BASE_ADDR, 0x1000);
-    if (!gpio0_base) {
-        printk(KERN_ERR "umdp: failed to map GPIO0 registers at 0x%08x\n", GPIO0_BASE_ADDR);
-        return -ENOMEM;
-    }
-    
-    gpio1_base = ioremap(GPIO1_BASE_ADDR, 0x1000);
-    if (!gpio1_base) {
-        printk(KERN_ERR "umdp: failed to map GPIO1 registers at 0x%08x\n", GPIO1_BASE_ADDR);
-        goto cleanup_gpio0;
-    }
-    
-    gpio2_base = ioremap(GPIO2_BASE_ADDR, 0x1000);
-    if (!gpio2_base) {
-        printk(KERN_ERR "umdp: failed to map GPIO2 registers at 0x%08x\n", GPIO2_BASE_ADDR);
-        goto cleanup_gpio1;
-    }
-    
-    uart0_base = ioremap(UART0_BASE_ADDR, 0x20);
-    if (!uart0_base) {
-        printk(KERN_ERR "umdp: failed to map UART0 registers at 0x%08x\n", UART0_BASE_ADDR);
-        goto cleanup_gpio2;
-    }
-    
-    pwm0_base = ioremap(PWM0_BASE_ADDR, 0x1000);
-    if (!pwm0_base) {
-        printk(KERN_ERR "umdp: failed to map PWM0 registers at 0x%08x\n", PWM0_BASE_ADDR);
-        goto cleanup_uart0;
-    }
-    
-    printk(KERN_INFO "umdp: successfully mapped hardware - GPIO0, GPIO1, GPIO2, UART0, PWM0\n");
-    return 0;
-
-cleanup_uart0:
-    iounmap(uart0_base);
-    uart0_base = NULL;
-cleanup_gpio2:
-    iounmap(gpio2_base);
-    gpio2_base = NULL;
-cleanup_gpio1:
-    iounmap(gpio1_base);
-    gpio1_base = NULL;
-cleanup_gpio0:
-    iounmap(gpio0_base);
-    gpio0_base = NULL;
-    return -ENOMEM;
-}
-
-// Hardware cleanup function
-static void umdp_cleanup_hardware(void) {
-    if (pwm0_base) {
-        iounmap(pwm0_base);
-        pwm0_base = NULL;
-    }
-    if (uart0_base) {
-        iounmap(uart0_base);
-        uart0_base = NULL;
-    }
-    if (gpio2_base) {
-        iounmap(gpio2_base);
-        gpio2_base = NULL;
-    }
-    if (gpio1_base) {
-        iounmap(gpio1_base);
-        gpio1_base = NULL;
-    }
-    if (gpio0_base) {
-        iounmap(gpio0_base);
-        gpio0_base = NULL;
-    }
-    printk(KERN_INFO "umdp: unmapped all hardware registers\n");
-}
-
-// Real hardware I/O read function
-static u8 riscv_hardware_read_u8(u64 port) {
-    void __iomem *addr;
-    u8 value;
-    
-    switch (port) {
-        case 0x60:  // Classic PS/2 keyboard data -> GPIO0 data register
-            if (!gpio0_base) return 0xFF;
-            addr = gpio0_base + 0x00;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read GPIO0[0x00]: 0x%02x (port 0x60)\n", value);
-            break;
-            
-        case 0x61:  // PS/2 keyboard status -> GPIO0 direction register
-            if (!gpio0_base) return 0xFF;
-            addr = gpio0_base + 0x04;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read GPIO0[0x04]: 0x%02x (port 0x61)\n", value);
-            break;
-            
-        case 0x64:  // PS/2 keyboard command -> GPIO1 data register
-            if (!gpio1_base) return 0xFF;
-            addr = gpio1_base + 0x00;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read GPIO1[0x00]: 0x%02x (port 0x64)\n", value);
-            break;
-            
-        case 0x3F8: // UART COM1 data -> real UART0 data
-            if (!uart0_base) return 0xFF;
-            addr = uart0_base + 0x00;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read UART0[0x00]: 0x%02x (port 0x3F8)\n", value);
-            break;
-            
-        case 0x3F9: // UART COM1 interrupt enable -> UART0 IER
-            if (!uart0_base) return 0xFF;
-            addr = uart0_base + 0x04;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read UART0[0x04]: 0x%02x (port 0x3F9)\n", value);
-            break;
-            
-        case 0x3FA: // UART COM1 interrupt ID -> UART0 IIR
-            if (!uart0_base) return 0xFF;
-            addr = uart0_base + 0x08;
-            value = ioread8(addr);
-            printk(KERN_INFO "umdp: read UART0[0x08]: 0x%02x (port 0x3FA)\n", value);
-            break;
-            
-        default:
-            printk(KERN_WARNING "umdp: unmapped I/O port 0x%llx, returning 0xFF\n", port);
-            value = 0xFF;
-            break;
-    }
-    
-    return value;
-}
-
-// Real hardware I/O write function
-static void riscv_hardware_write_u8(u64 port, u8 value) {
-    void __iomem *addr;
-    
-    switch (port) {
-        case 0x60:  // Classic PS/2 keyboard data -> GPIO0 data register
-            if (!gpio0_base) return;
-            addr = gpio0_base + 0x00;
-            iowrite8(value, addr);
-            printk(KERN_INFO "umdp: wrote 0x%02x to GPIO0[0x00] (port 0x60)\n", value);
-            break;
-            
-        case 0x61:  // PS/2 keyboard status -> GPIO0 direction register
-            if (!gpio0_base) return;
-            addr = gpio0_base + 0x04;
-            iowrite8(value, addr);
-            printk(KERN_INFO "umdp: wrote 0x%02x to GPIO0[0x04] (port 0x61)\n", value);
-            break;
-            
-        case 0x64:  // PS/2 keyboard command -> GPIO1 data register
-            if (!gpio1_base) return;
-            addr = gpio1_base + 0x00;
-            iowrite8(value, addr);
-            printk(KERN_INFO "umdp: wrote 0x%02x to GPIO1[0x00] (port 0x64)\n", value);
-            break;
-            
-        case 0x3F8: // UART COM1 data -> real UART0 data
-            if (!uart0_base) return;
-            addr = uart0_base + 0x00;
-            iowrite8(value, addr);
-            printk(KERN_INFO "umdp: wrote 0x%02x to UART0[0x00] (port 0x3F8)\n", value);
-            break;
-            
-        case 0x3F9: // UART COM1 interrupt enable -> UART0 IER
-            if (!uart0_base) return;
-            addr = uart0_base + 0x04;
-            iowrite8(value, addr);
-            printk(KERN_INFO "umdp: wrote 0x%02x to UART0[0x04] (port 0x3F9)\n", value);
-            break;
-            
-        default:
-            printk(KERN_WARNING "umdp: unmapped I/O port 0x%llx, ignoring write of 0x%02x\n", port, value);
-            break;
-    }
-}
-
-// 16-bit read function
-static u16 riscv_hardware_read_u16(u64 port) {
-    // For 16-bit reads, read two consecutive 8-bit registers
-    u8 low = riscv_hardware_read_u8(port);
-    u8 high = riscv_hardware_read_u8(port + 1);
-    u16 value = low | (high << 8);
-    printk(KERN_INFO "umdp: 16-bit read from port 0x%llx: 0x%04x\n", port, value);
-    return value;
-}
-
-// 16-bit write function
-static void riscv_hardware_write_u16(u64 port, u16 value) {
-    u8 low = value & 0xFF;
-    u8 high = (value >> 8) & 0xFF;
-    riscv_hardware_write_u8(port, low);
-    riscv_hardware_write_u8(port + 1, high);
-    printk(KERN_INFO "umdp: 16-bit write to port 0x%llx: 0x%04x\n", port, value);
-}
-
-// 32-bit read function
-static u32 riscv_hardware_read_u32(u64 port) {
-    u16 low = riscv_hardware_read_u16(port);
-    u16 high = riscv_hardware_read_u16(port + 2);
-    u32 value = low | (high << 16);
-    printk(KERN_INFO "umdp: 32-bit read from port 0x%llx: 0x%08x\n", port, value);
-    return value;
-}
-
-// 32-bit write function
-static void riscv_hardware_write_u32(u64 port, u32 value) {
-    u16 low = value & 0xFFFF;
-    u16 high = (value >> 16) & 0xFFFF;
-    riscv_hardware_write_u16(port, low);
-    riscv_hardware_write_u16(port + 2, high);
-    printk(KERN_INFO "umdp: 32-bit write to port 0x%llx: 0x%08x\n", port, value);
-}
-
-static inline void *krealloc_array_compat(void *p, size_t new_n, size_t size, gfp_t flags)
-{
-    size_t bytes;
-    if (unlikely(check_mul_overflow(new_n, size, &bytes)))
-        return NULL;
-    return krealloc(p, bytes, flags);
-}
 
 static struct nla_policy umdp_genl_connect_policy[UMDP_ATTR_CONNECT_MAX + 1] = {
     [UMDP_ATTR_CONNECT_PID] =
@@ -530,40 +285,32 @@ static struct nlattr* find_attribute(struct nlattr** attributes, int type) {
 /// The returned string must be freed by the caller using `kfree()`.
 static char* exe_path_of_task(struct task_struct* task) {
     char* exe_path = NULL;
-    struct mm_struct* mm;
-    struct file* exe_file;
-    char* buf;
-    char* file_path_buf;
-    size_t file_path_len;
 
-    mm = get_task_mm(task);
+    struct mm_struct* mm = get_task_mm(task);
     if (mm == NULL) {
         return NULL;
     }
 
     rcu_read_lock();
-    exe_file = rcu_dereference(mm->exe_file);
-    if (exe_file && !get_file_rcu(exe_file)) {
-        exe_file = NULL;
-    }
+    struct file* exe_file = get_file_rcu(&mm->exe_file);
     rcu_read_unlock();
 
     if (exe_file == NULL) {
         goto fail_after_mm;
     }
 
-    buf = kmalloc(PATH_MAX, GFP_KERNEL);
+    char* buf = kmalloc(PATH_MAX, GFP_KERNEL);
     if (buf == NULL) {
         goto fail_after_file;
     }
 
-    file_path_buf = d_path(&exe_file->f_path, buf, PATH_MAX);
+    char* file_path_buf = d_path(&exe_file->f_path, buf, PATH_MAX);
     if (IS_ERR(file_path_buf)) {
         printk(KERN_ERR "umdp: d_path failed (error code %ld)\n", PTR_ERR(file_path_buf));
     } else if (unlikely(file_path_buf == NULL)) {
         printk(KERN_ERR "umdp: d_path returned NULL\n");
     } else {
-        file_path_len = strnlen(file_path_buf, PATH_MAX);
+        size_t file_path_len = strnlen(file_path_buf, PATH_MAX);
         exe_path = kmalloc(file_path_len + 1, GFP_KERNEL);
         if (exe_path == NULL) {
             goto fail_after_buf;
@@ -594,7 +341,7 @@ static char* exe_path_of_pid(struct pid* pid) {
 }
 
 struct client_info {
-    struct list_head list;  // Change from 'list_entry' to 'list'
+    struct list_head list;
     u32 port_id;
     struct pid* pid;
     char* exe_path;
@@ -779,9 +526,7 @@ struct partial_netlink_sock {
 
 static int check_if_open_file_is_netlink_socket_with_port_id(
     const void* v, struct file* file, __attribute__((unused)) unsigned fd) {
-    int sock_err;
-    struct socket* socket = sock_from_file(file, &sock_err);
-    if (!socket) return 0;
+    struct socket* socket = sock_from_file(file);
     if (socket == NULL || socket->ops->family != PF_NETLINK) {
         return 0;
     }
@@ -809,50 +554,22 @@ static bool check_process_for_netlink_socket_with_port_id(struct pid* pid, u32 p
     return result != 0;
 }
 
-// Find the umdp_connect function and replace the socket validation part:
-
 static int umdp_connect(struct sk_buff* skb, struct genl_info* info) {
-    u32 received_portid;
-    struct nlattr* pid_attr;
-    s32 pid_number;
-    struct pid* pid;
-    bool found;
-    bool registered;
-    
-    received_portid = info->snd_portid;
-    printk(KERN_INFO "umdp: received connect request from portid %u\n", received_portid);
+    printk(KERN_DEBUG "umdp: received connect request from portid %u\n", info->snd_portid);
 
-    pid_attr = find_attribute(info->attrs, UMDP_ATTR_CONNECT_PID);
+    struct nlattr* pid_attr = find_attribute(info->attrs, UMDP_ATTR_CONNECT_PID);
     if (pid_attr == NULL) {
         printk(KERN_ERR "umdp: did not find PID attribute in connect request\n");
         return -EINVAL;
     }
-    pid_number = *(s32*) nla_data(pid_attr);
-    printk(KERN_INFO "umdp: connect request claims to be from PID %d\n", pid_number);
+    s32 pid_number = *(s32*) nla_data(pid_attr);
 
-    pid = find_get_pid(pid_number);
-    if (!pid) {
-        printk(KERN_ERR "umdp: PID %d not found\n", pid_number);
-        return -ESRCH;
-    }
+    struct pid* pid = find_get_pid(pid_number);
+    bool found = check_process_for_netlink_socket_with_port_id(pid, info->snd_portid);
 
-    // BYPASS THE BROKEN SOCKET VALIDATION
-    printk(KERN_INFO "umdp: BYPASSING broken socket validation (would look for portid %u)\n", received_portid);
-    found = true;  // Always succeed for now
-    
-    // Comment out the broken validation:
-    /*
-    if (!check_process_for_netlink_socket_with_port_id(current, received_portid)) {
-        printk(KERN_INFO "umdp: process does not have a netlink socket with the expected portid\n");
-        put_pid(pid);
-        return -EPERM;
-    }
-    found = true;
-    */
-
-    registered = false;
+    bool registered = false;
     if (found) {
-        printk(KERN_INFO "umdp: registering client with portid %u from PID %d\n", received_portid, pid_number);
+        printk(KERN_DEBUG "umdp: connect request was from pid %d\n", pid_number);
         down_write(&client_info_lock);
         registered = register_client_if_not_registered(info->snd_portid, pid);
         up_write(&client_info_lock);
@@ -862,27 +579,21 @@ static int umdp_connect(struct sk_buff* skb, struct genl_info* info) {
         put_pid(pid);
     }
 
-    // Continue with reply sending (rest of function unchanged)
-    struct sk_buff* reply;
-    void* reply_header;
-    u8 value;
-    int ret;
-
-    reply = genlmsg_new(nla_total_size(sizeof(u8)), GFP_KERNEL);
+    struct sk_buff* reply = genlmsg_new(nla_total_size(sizeof(u8)), GFP_KERNEL);
     if (reply == NULL) {
         printk(KERN_ERR "umdp: failed to allocate buffer for connect reply\n");
         return -ENOMEM;
     }
 
-    reply_header = genlmsg_put_reply(reply, info, &umdp_genl_family, 0, UMDP_CMD_CONNECT);
+    void* reply_header = genlmsg_put_reply(reply, info, &umdp_genl_family, 0, UMDP_CMD_CONNECT);
     if (reply_header == NULL) {
         nlmsg_free(reply);
         printk(KERN_ERR "umdp: failed to add the generic netlink header to the connect reply\n");
         return -EMSGSIZE;
     }
 
-    value = registered ? 1 : 0;
-    ret = nla_put_u8(reply, UMDP_ATTR_CONNECT_REPLY, value);
+    u8 value = registered ? 1 : 0;
+    int ret = nla_put_u8(reply, UMDP_ATTR_CONNECT_REPLY, value);
     if (ret != 0) {
         nlmsg_free(reply);
         printk(KERN_ERR "umdp: failed to write value to reply\n");
@@ -896,8 +607,6 @@ static int umdp_connect(struct sk_buff* skb, struct genl_info* info) {
         return ret;
     }
 
-    printk(KERN_INFO "umdp: connect reply sent successfully (registered=%s)\n", 
-           registered ? "true" : "false");
     return 0;
 }
 
@@ -974,32 +683,35 @@ static int umdp_devio_read(struct sk_buff* skb, struct genl_info* info) {
         return -EMSGSIZE;
     }
 
-    // Replace the switch statement in umdp_devio_read (around line 745):
-
     int ret;
     switch (reply_size) {
         case sizeof(u8): {
-            u8 value = riscv_hardware_read_u8(port);
-            printk(KERN_DEBUG "umdp: read %u (0x%02x) from port %llu\n", value, value, port);
+            u8 value = inb(port);
+            printk(KERN_DEBUG "umdp: read %u (%x) from port %llu\n", value, value, port);
             ret = nla_put_u8(reply, UMDP_ATTR_DEVIO_READ_REPLY_U8, value);
             break;
         }
         case sizeof(u16): {
-            u16 value = riscv_hardware_read_u16(port);
-            printk(KERN_DEBUG "umdp: read %u (0x%04x) from port %llu\n", value, value, port);
+            u16 value = inw(port);
+            printk(KERN_DEBUG "umdp: read %u (%x) from port %llu\n", value, value, port);
             ret = nla_put_u16(reply, UMDP_ATTR_DEVIO_READ_REPLY_U16, value);
             break;
         }
         case sizeof(u32): {
-            u32 value = riscv_hardware_read_u32(port);
-            printk(KERN_DEBUG "umdp: read %u (0x%08x) from port %llu\n", value, value, port);
+            u32 value = inl(port);
+            printk(KERN_DEBUG "umdp: read %u (%x) from port %llu\n", value, value, port);
             ret = nla_put_u32(reply, UMDP_ATTR_DEVIO_READ_REPLY_U32, value);
             break;
         }
         default:
+            printk(KERN_ERR "umdp: BUG! This code should be unreachable.\n");
             nlmsg_free(reply);
-            printk(KERN_ERR "umdp: invalid reply size %d\n", reply_size);  // Change %zu to %d
             return -EINVAL;
+    }
+    if (ret != 0) {
+        nlmsg_free(reply);
+        printk(KERN_ERR "umdp: failed to write value to reply\n");
+        return ret;
     }
 
     genlmsg_end(reply, reply_header);
@@ -1049,25 +761,24 @@ static int umdp_devio_write(struct sk_buff* skb, struct genl_info* info) {
         switch (nla_type(info->attrs[i])) {
             case UMDP_ATTR_DEVIO_WRITE_VALUE_U8: {
                 u8 value = *((u8*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u8(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%02x) to port %llu\n", value, value, port);
+                printk(KERN_DEBUG "umdp: writing %u (%x) to port %llu\n", value, value, port);
+                outb(value, port);
                 return 0;
             }
             case UMDP_ATTR_DEVIO_WRITE_VALUE_U16: {
                 u16 value = *((u16*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u16(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%04x) to port %llu\n", value, value, port);
+                printk(KERN_DEBUG "umdp: writing %u (%x) to port %llu\n", value, value, port);
+                outw(value, port);
                 return 0;
             }
             case UMDP_ATTR_DEVIO_WRITE_VALUE_U32: {
                 u32 value = *((u32*) nla_data(info->attrs[i]));
-                riscv_hardware_write_u32(port, value);
-                printk(KERN_DEBUG "umdp: wrote %u (0x%08x) to port %llu\n", value, value, port);
+                printk(KERN_DEBUG "umdp: writing %u (%x) to port %llu\n", value, value, port);
+                outl(value, port);
                 return 0;
             }
             default:
-                printk(KERN_ERR "umdp: unknown attribute type %d\n", nla_type(info->attrs[i]));
-                return -EINVAL;
+                break;
         }
     }
 
@@ -1142,22 +853,14 @@ static int umdp_devio_request(struct sk_buff* skb, struct genl_info* info) {
         return -EPERM;
     }
 
-    // Replace the access control check with this bypass:
-
-    // TEMPORARY BYPASS FOR TESTING - REMOVE AFTER CONFIRMING FUNCTIONALITY
-    printk(KERN_INFO "umdp: BYPASSING access control - allowing %s to access region %llu-%llu\n", 
-       this_client_info->exe_path, region.start, region.start + region.size - 1);
-
-    /* Original access control (commented out for testing):
     if (!umdp_ac_can_access_port_io_region(this_client_info->exe_path, region)) {
-    up_write(&client_info_lock);
-    printk(KERN_INFO "umdp: %s not allowed to access the requested region, refusing request\n",
-        this_client_info->exe_path);
-    return -EPERM;
+        up_write(&client_info_lock);
+        printk(KERN_INFO "umdp: %s not allowed to access the requested region, refusing request\n",
+            this_client_info->exe_path);
+        return -EPERM;
     }
-    */
 
-    struct port_io_region* new_regions = krealloc_array_compat(this_client_info->requested_port_io_regions,
+    struct port_io_region* new_regions = krealloc_array(this_client_info->requested_port_io_regions,
         this_client_info->requested_port_io_regions_count + 1, sizeof(struct port_io_region), GFP_KERNEL);
     if (new_regions == NULL) {
         up_write(&client_info_lock);
@@ -1393,7 +1096,7 @@ static int umdp_interrupt_subscribe(struct sk_buff* skb, struct genl_info* info)
         return -EPERM;
     }
 
-    u32* new_irqs = krealloc_array_compat(
+    u32* new_irqs = krealloc_array(
         this_client_info->registered_irqs, this_client_info->registered_irqs_count + 1, sizeof(u32), GFP_KERNEL);
     if (new_irqs == NULL) {
         up_write(&client_info_lock);
@@ -1525,7 +1228,7 @@ static int umdp_mem_mmap(struct file* file __attribute__((unused)), struct vm_ar
         return -EPERM;
     }
 
-    vma->vm_flags |= VM_IO;
+    vma->__vm_flags |= VM_IO;
 
     printk(KERN_DEBUG "umdp: performing mmap of region 0x%lx-0x%lx to address 0x%lu of PID %d\n", physical_start_addr,
         physical_end_addr, vma->vm_start, current->pid);
@@ -1548,93 +1251,139 @@ static struct class* umdp_mem_dev_class;
 
 static bool kprobe_registered = false;
 
-// Replace the existing umdp_init function with this complete version:
-
-// Replace the umdp_init function references:
-
-static int __init umdp_init(void) {
-    int ret;
-    
-    printk(KERN_INFO "umdp: Loading UMDP module with real RISC-V hardware support\n");
-    
-    ret = umdp_init_hardware();
+static int umdp_init(void) {
+    int ret = umdp_ac_init();
     if (ret != 0) {
-        printk(KERN_ERR "umdp: Failed to initialize hardware mappings (error code %d)\n", ret);
-        return ret;
+        goto fail;
     }
-    
-    // Fix kprobe registration - use the existing do_exit_kp
-    ret = register_kprobe(&do_exit_kp);
+
+    ret = alloc_chrdev_region(&umdp_mem_chrdev, 0, 1, UMDP_MEM_DEVICE_NAME);
     if (ret != 0) {
-        printk(KERN_ERR "umdp: Failed to register kprobe (error code %d), resources won't be freed on process exit\n", ret);
+        printk(KERN_ERR "umdp: Failed to allocate character device (error code %d)\n", -ret);
+        goto fail_after_ac_init;
+    }
+
+    cdev_init(&umdp_mem_cdev, &umdp_mem_fops);
+    umdp_mem_cdev.owner = THIS_MODULE;
+    ret = kobject_set_name(&umdp_mem_cdev.kobj, UMDP_MEM_DEVICE_NAME);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to set character device name (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    ret = cdev_add(&umdp_mem_cdev, umdp_mem_chrdev, 1);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to add character device to system (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    umdp_mem_dev_class = class_create(UMDP_MEM_CLASS_NAME);
+    if (IS_ERR(umdp_mem_dev_class)) {
+        ret = (int) PTR_ERR(umdp_mem_dev_class);
+        printk(KERN_ERR "umdp: Failed to create character device class (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    struct device* umdp_mem_device =
+        device_create(umdp_mem_dev_class, NULL, umdp_mem_chrdev, NULL, UMDP_MEM_DEVICE_NAME);
+    if (IS_ERR(umdp_mem_device)) {
+        ret = (int) PTR_ERR(umdp_mem_device);
+        printk(KERN_ERR "umdp: Failed to create character device (error code %d)\n", -ret);
+        goto fail_after_class_create;
+    }
+
+    ih_workqueue = alloc_workqueue("umdp_interrupt_wq", 0, 0);
+    if (ih_workqueue == NULL) {
+        ret = -ENOMEM;
+        printk(KERN_ERR "umdp: failed to allocate workqueue for interrupt handling");
+        goto fail_after_device_create;
+    }
+
+    size_t i;
+    for (i = 0; i < UMDP_WORKER_COUNT; i++) {
+        ih_workers[i].busy = false;
+    }
+
+    // Since the cleanup task needs a write lock, there's no point in executing more than one task at once.
+    // As such, we use an unbound workqueue with max_active set to 1.
+    exit_cleanup_workqueue = alloc_workqueue("umdp_exit_cleanup_wq", WQ_UNBOUND, 1);
+    if (exit_cleanup_workqueue != NULL) {
+        ret = register_kprobe(&do_exit_kp);
+        if (ret == 0) {
+            kprobe_registered = true;
+        } else {
+            destroy_workqueue(exit_cleanup_workqueue);
+            exit_cleanup_workqueue = NULL;
+            if (ret == -EOPNOTSUPP) {
+                printk(KERN_WARNING
+                    "umdp: This kernel does not support kprobes (it was built with CONFIG_KPROBES=n), resources won't "
+                    "be freed on process exit\n");
+            } else {
+                printk(KERN_WARNING
+                    "umdp: Failed to register kprobe (error code %d), resources won't be freed on process exit\n",
+                    -ret);
+            }
+            ret = 0;
+        }
     } else {
-        printk(KERN_INFO "umdp: Successfully registered kprobe for process exit tracking\n");
+        printk(KERN_WARNING "umdp: failed to allocate workqueue, resources won't be freed on process exit");
     }
-    
+
     ret = genl_register_family(&umdp_genl_family);
     if (ret != 0) {
         printk(KERN_ERR "umdp: Failed to register netlink family (error code %d)\n", ret);
-        goto cleanup_kprobe;
+        goto fail_after_kprobe_register;
     }
-    
+
     printk(KERN_INFO "umdp: Registered netlink kernel family (id: %d)\n", umdp_genl_family.id);
-    printk(KERN_INFO "umdp: Module loaded successfully with real hardware access\n");
-    
     return 0;
 
-cleanup_kprobe:
-    if (do_exit_kp.addr) {
+fail_after_kprobe_register:
+    if (kprobe_registered) {
         unregister_kprobe(&do_exit_kp);
-        printk(KERN_INFO "umdp: Unregistered kprobe due to init failure\n");
     }
-    
-    umdp_cleanup_hardware();
-    printk(KERN_ERR "umdp: Module initialization failed\n");
+fail_after_device_create:
+    device_destroy(umdp_mem_dev_class, umdp_mem_chrdev);
+fail_after_class_create:
+    class_destroy(umdp_mem_dev_class);
+fail_after_cdev_init:
+    cdev_del(&umdp_mem_cdev);
+    unregister_chrdev_region(umdp_mem_chrdev, 1);
+fail_after_ac_init:
+    umdp_ac_exit();
+fail:
     return ret;
 }
 
-// Replace the umdp_exit function:
-
-static void __exit umdp_exit(void) {
-    struct client_info* client_info;
-    struct client_info* tmp;
-    int client_count = 0;
-    
-    printk(KERN_INFO "umdp: Unloading UMDP module\n");
-    
-    genl_unregister_family(&umdp_genl_family);
-    printk(KERN_INFO "umdp: Unregistered netlink family\n");
-    
-    if (do_exit_kp.addr) {
-        unregister_kprobe(&do_exit_kp);
-        printk(KERN_INFO "umdp: Unregistered kprobe\n");
+static void umdp_exit(void) {
+    int ret = genl_unregister_family(&umdp_genl_family);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to unregister netlink family\n");
+    } else {
+        printk(KERN_INFO "umdp: Unregistered netlink family\n");
     }
-    
+
+    if (kprobe_registered) {
+        unregister_kprobe(&do_exit_kp);
+        destroy_workqueue(exit_cleanup_workqueue);
+    }
+
+    destroy_workqueue(ih_workqueue);
+
+    device_destroy(umdp_mem_dev_class, umdp_mem_chrdev);
+    class_destroy(umdp_mem_dev_class);
+    cdev_del(&umdp_mem_cdev);
+    unregister_chrdev_region(umdp_mem_chrdev, 1);
+
     down_write(&client_info_lock);
-    list_for_each_entry_safe(client_info, tmp, &client_info_list, list) {  // Fix: use 'list' not 'list_entry'
-        client_count++;
-        printk(KERN_INFO "umdp: Cleaning up client info for PID %d (port %u)\n", 
-               pid_nr(client_info->pid), client_info->port_id);
-        
-        if (client_info->pid) {
-            put_pid(client_info->pid);
-        }
-        
-        if (client_info->exe_path) {
-            kfree(client_info->exe_path);
-        }
-        
-        list_del(&client_info->list);  // Fix: use 'list' not 'list_entry'
-        kfree(client_info);
+    struct client_info* p;
+    struct client_info* next;
+    for_each_client_info_safe(p, next) {
+        remove_client(p);
     }
     up_write(&client_info_lock);
-    
-    if (client_count > 0) {
-        printk(KERN_INFO "umdp: Cleaned up %d remaining client entries\n", client_count);
-    }
-    
-    umdp_cleanup_hardware();
-    printk(KERN_INFO "umdp: Module unloaded successfully, hardware unmapped\n");
+
+    umdp_ac_exit();
 }
 
 module_init(umdp_init);
