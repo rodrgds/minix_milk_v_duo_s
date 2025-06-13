@@ -1337,7 +1337,7 @@ static int umdp_init(void) {
         } else {
             destroy_workqueue(exit_cleanup_workqueue);
             exit_cleanup_workqueue = NULL;
-            if (ret == -EOPNOTSUPP) {
+            if (ret == -EOPNOTSUPP || ret == -ENOSYS) {
                 printk(KERN_WARNING
                     "umdp: This kernel does not support kprobes (it was built with CONFIG_KPROBES=n), resources won't "
                     "be freed on process exit\n");
