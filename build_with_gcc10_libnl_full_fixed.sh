@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "=== Building RISC-V libumdp with libnl support (Fixed) ==="
+echo "=== Building RISC-V libumdp with libnl support ==="
 
 # 1. Create a temporary toolchain directory
 TOOLCHAIN_DIR="$HOME/toolchains/riscv-gcc10"
