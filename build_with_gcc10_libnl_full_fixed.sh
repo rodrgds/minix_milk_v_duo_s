@@ -3,21 +3,21 @@ set -e
 
 echo "=== Building RISC-V libumdp with libnl support ==="
 
-# 1. Create a temporary toolchain directory
+# Create a temporary toolchain directory
 TOOLCHAIN_DIR="$HOME/toolchains/riscv-gcc10"
 mkdir -p "$TOOLCHAIN_DIR"
 
-# 2. Link gcc-10 and other tools
+# Link gcc-10 and other tools
 ln -sf /usr/bin/riscv64-linux-gnu-gcc-10 "$TOOLCHAIN_DIR/riscv64-linux-gnu-gcc"
 ln -sf /usr/bin/riscv64-linux-gnu-g++-10 "$TOOLCHAIN_DIR/riscv64-linux-gnu-g++"
 ln -sf /usr/bin/riscv64-linux-gnu-ar     "$TOOLCHAIN_DIR/riscv64-linux-gnu-ar"
 ln -sf /usr/bin/riscv64-linux-gnu-strip  "$TOOLCHAIN_DIR/riscv64-linux-gnu-strip"
 ln -sf /usr/bin/riscv64-linux-gnu-ranlib "$TOOLCHAIN_DIR/riscv64-linux-gnu-ranlib"
 
-# 3. Set up environment
+# Set up environment
 export PATH="$TOOLCHAIN_DIR:$PATH"
 
-# 4. RISC-V sysroot and libnl paths
+# RISC-V sysroot and libnl paths
 SYSROOT="/home/luhen_39/pi/duo-buildroot-sdk/ramdisk/rootfs/common_musl_riscv64"
 INSTALL_PREFIX="$HOME/riscv-libnl-static"  # Use static version
 INSTALL_PREFIX_DYNAMIC="$HOME/riscv-libnl"

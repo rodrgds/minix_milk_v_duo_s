@@ -1,64 +1,132 @@
-# Linux Usermode Driver Platform
+# Plataforma de Drivers em Espaço de Utilizador para Linux - Versão RISC-V
 
-This is a Linux kernel module to allow userland applications to interface with hardware directly, similar to how drivers are implemented in microkernel systems, such as MINIX.
+## Objetivo
 
-This is an academic project.
+Este repositório contém uma versão adaptada do módulo do kernel Linux que permite às aplicações em espaço de utilizador interagir diretamente com o hardware — de forma semelhante à abordagem utilizada em sistemas como o MINIX.
 
-## Requirements
+Esta versão foi especificamente adaptada para funcionar em arquiteturas RISC-V, com foco na compatibilidade com plataformas embebidas.
 
-### Kernel module
+Este trabalho foi desenvolvido no âmbito do Projeto Integrador (PE39 - LEIC - FEUP).
 
-* GCC, Make, and other build dependencies of the Linux kernel
-* The kernel headers for the kernel you're using
-* DKMS (optional)
+---
 
-### Library
+## Autoria
 
-* A C11 compiler toolchain
-* [Meson](https://mesonbuild.com)
+O módulo UMDP foi originalmente criado por **Joaquim Monteiro**.  
+Repositório original disponível em:  
+[https://github.com/MonterraByte/linux-usermode-driver-platform](https://github.com/MonterraByte/linux-usermode-driver-platform/tree/master)
 
-## Building
+---
 
-### Kernel module
+## Modificações Realizadas
 
-You can invoke `make` directly to build the module:
+As alterações nesta versão foram mínimas e concentraram-se nos ficheiros:
 
-    $ cd umdp
-    $ make
+- `umdp_ac.c`
+- `umdp_core.c`
 
-Alternatively, DKMS can be used to build and install it:
+Estas modificações foram necessárias para garantir o correto funcionamento do módulo em sistemas embebidos baseados em RISC-V.
 
-    # dkms add umdp/
-    # dkms build umdp/0.1.0
-    # dkms install umdp/0.1.0
+---
 
-### Library
+## Requisitos
 
-The library can be built using Meson:
+### Para Compilação
 
-    $ cd libumdp
-    $ meson setup build/
-    $ meson compile -C build/
+- Toolchain RISC-V: `gcc-riscv64-linux-gnu` (versão 10.5.0)
+- Headers do Kernel Linux para RISC-V (normalmente incluídos no SDK do Milk-V Duo S)
+- Ferramentas de compilação:
+  - `make`
+  - `meson`
+  - `ninja`
+- Dependências da biblioteca:
+  - `libnl-3-dev`
+  - `pkg-config`
+- SDK do Milk-V Duo S: Para acesso aos headers corretos do kernel
 
-To install it, use:
+### Para Execução no Milk-V Duo S
 
-    # meson install -C build/
+- Dispositivo Milk-V Duo S com Linux kernel 5.10 ou superior
+- Ligação de rede (Ethernet ou Wi-Fi) para SCP/SSH
+- Acesso root no dispositivo
+- Kernel compilado com suporte a módulos carregáveis (`CONFIG_MODULES=y`)
 
-Meson will install the library to `/usr/local/`. To install it to a different location, use the `--prefix` flag.
+---
 
-It can also be used (without requiring installation) as a Meson subproject.
+## Verificação dos Requisitos
 
-### Examples
+Execute os seguintes comandos para confirmar se os requisitos estão instalados corretamente:
 
-To build the examples, pass `-D examples=true` to the `meson setup` command when setting up the build,
-or run `meson configure -D examples=true build/` to enable them on an already configured Meson build directory, then build the project like before.
+```bash
+# Verificar a toolchain RISC-V
+riscv64-linux-gnu-gcc-10 --version
 
-## Usage
+# Verificar o Meson
+meson --version
 
-Load the module with:
+# Verificar se a libnl está disponível
+pkg-config --exists libnl-3.0 && echo "libnl OK" || echo "libnl em falta"
+```
 
-    # modprobe umdp
+--- 
 
-Alternatively, if not installed, it can be loaded directly with:
+## Compilação Simplificada
 
-    # insmod umdp.ko
+Para evitar configurações manuais complexas, estão incluídos scripts Bash que automatizam o processo de compilação.
+
+## Compilar o Módulo do Kernel (`umdp.ko`)
+
+```bash
+cd umdp/
+./build_with_gcc10.sh
+```
+
+Este script configura automaticamente o ambiente de cross-compilation e compila o módulo umdp.ko.
+
+## Compilar a Biblioteca Estática
+
+```bash
+./build_with_gcc10_libnl_full_fixed.sh
+```
+
+Este script:
+
+- Configura o ambiente de cross-compilation para RISC-V;
+- Compila a biblioteca com suporte completo à `libnl;
+- Gera uma biblioteca estática (`libumdp.a`) que pode ser facilmente integrada em projetos embebidos.
+
+## Utilização
+
+Após a compilação, o módulo pode ser carregado com o comando:
+
+```bash
+insmod umdp.ko
+```
+
+## Envio para o Milk-V Duo S
+
+### Transferir o Módulo do Kernel
+
+```bash
+scp umdp/umdp.ko root@<IP_DO_MILK_V>:/tmp/
+```
+
+### Transferir a Biblioteca Estática
+
+```bash
+scp libumdp/build_riscv_libnl/libumdp.a root@<IP_DO_MILK_V>:/tmp/
+```
+
+Substituir `<IP_DO_MILK_V>` pelo endereço IP do seu dispositivo Milk-V Duo S.
+
+### Aceder ao Dispositivo e Carregar o Módulo
+
+```bash
+ssh root@<IP_DO_MILK_V>
+insmod /tmp/umdp.ko
+```
+
+
+
+
+
