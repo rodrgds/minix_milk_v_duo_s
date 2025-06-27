@@ -1,4 +1,4 @@
-# Plataforma de Drivers em Espaço de Utilizador para Linux - Versão RISC-V
+# Linux Usermode Driver Platform - Versão RISC-V
 
 ## Objetivo
 
