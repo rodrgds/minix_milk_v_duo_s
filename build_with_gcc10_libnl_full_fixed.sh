@@ -37,7 +37,7 @@ fi
 
 cd /home/luhen_39/pi/minix/linux-usermode-driver-platform
 
-# Create cross-compilation file with CORRECTED libnl paths
+# Create cross-compilation file with libnl paths
 cat > riscv64-cross-with-libnl-fixed.txt << EOF2
 [binaries]
 c = 'riscv64-linux-gnu-gcc'
@@ -62,7 +62,7 @@ sys_root = '$SYSROOT'
 pkg_config_path = '$LIBNL_PATH/lib/pkgconfig'
 EOF2
 
-# Set pkg-config to find our RISC-V libnl
+# Set pkg-config to find the RISC-V libnl
 export PKG_CONFIG_PATH="$LIBNL_PATH/lib/pkgconfig"
 
 # Verify pkg-config can find libnl
@@ -106,28 +106,6 @@ if [ $? -eq 0 ]; then
     # Show file architecture
     echo "Checking built library architecture:"
     file build_riscv_libnl/libumdp.* 2>/dev/null || echo "No library files found"
-    
-    # Build the devio example with static linking
-    cd ..
-    echo "Building static devio with libnl support..."
-    
-    riscv64-linux-gnu-gcc \
-        --sysroot="$SYSROOT" \
-        -static \
-        -I"libumdp/include" \
-        -I"$LIBNL_PATH/include/libnl3" \
-        -o devio_libnl_static \
-        libumdp/examples/devio.c \
-        libumdp/build_riscv_libnl/libumdp.a \
-        "$LIBNL_PATH/lib/libnl-3.a" \
-        "$LIBNL_PATH/lib/libnl-genl-3.a"
-    
-    echo "Verifying the static executable:"
-    file devio_libnl_static
-    ldd devio_libnl_static 2>&1 || echo "Static executable (good!)"
-    ls -lh devio_libnl_static
-    
-    echo "SUCCESS: devio_libnl_static is ready for transfer to Milk-V Duo S"
     
 else
     echo "Build failed!"
