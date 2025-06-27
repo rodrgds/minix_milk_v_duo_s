@@ -4,8 +4,6 @@
 
 Este repositório contém uma versão adaptada do módulo do kernel Linux que permite às aplicações em espaço de utilizador interagir diretamente com o hardware — de forma semelhante à abordagem utilizada em sistemas como o MINIX.
 
-Esta versão foi especificamente adaptada para funcionar em arquiteturas RISC-V, com foco na compatibilidade com plataformas embebidas.
-
 Este trabalho foi desenvolvido no âmbito do Projeto Integrador (PE39 - LEIC - FEUP).
 
 ---
@@ -47,7 +45,7 @@ Estas modificações foram necessárias para garantir o correto funcionamento do
 ### Para Execução no Milk-V Duo S
 
 - Dispositivo Milk-V Duo S com Linux kernel 5.10 ou superior
-- Ligação de rede (Ethernet ou Wi-Fi) para SCP/SSH
+- Ligação de rede (conexão USB) para SCP/SSH
 - Acesso root no dispositivo
 - Kernel compilado com suporte a módulos carregáveis (`CONFIG_MODULES=y`)
 
