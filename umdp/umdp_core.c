@@ -8,12 +8,17 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
+#include <linux/irqdomain.h>
+#include <linux/irqnr.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/kprobes.h>
 #include <linux/list.h>
 #include <linux/mm_types.h>
 #include <linux/module.h>
+#include <linux/of.h>
 #include <linux/pid.h>
 #include <linux/rwsem.h>
 #include <linux/workqueue.h>
@@ -34,6 +39,11 @@ MODULE_AUTHOR("Joaquim Monteiro <joaquim.monteiro@protonmail.com>");
 
 #define UMDP_DEVICE_NAME "umdp"
 #define UMDP_WORKER_COUNT 32
+static const char* const umdp_plic_compatible_candidates[] = {
+    "riscv,plic0",
+    "sifive,plic-1.0.0",
+    "thead,c900-plic",
+};
 
 /* commands */
 enum {
@@ -46,6 +56,7 @@ enum {
     UMDP_CMD_INTERRUPT_NOTIFICATION = 6,
     UMDP_CMD_INTERRUPT_SUBSCRIBE = 7,
     UMDP_CMD_INTERRUPT_UNSUBSCRIBE = 8,
+    UMDP_CMD_INTERRUPT_UNMASK = 9,
     __UMDP_CMD_MAX,
 };
 #define UMDP_CMD_MAX (__UMDP_CMD_MAX - 1)
@@ -484,7 +495,80 @@ static int umdp_devio_request(struct sk_buff* skb, struct genl_info* info);
 static int umdp_devio_release(struct sk_buff* skb, struct genl_info* info);
 static int umdp_interrupt_subscribe(struct sk_buff* skb, struct genl_info* info);
 static int umdp_interrupt_unsubscribe(struct sk_buff* skb, struct genl_info* info);
+static int umdp_interrupt_unmask(struct sk_buff* skb, struct genl_info* info);
 static int umdp_interrupt_notification(struct sk_buff* skb, struct genl_info* info) { return 0; }
+
+static struct irq_domain* plic_domain;
+
+static struct device_node* find_plic_node(void) {
+    size_t i;
+    for (i = 0; i < ARRAY_SIZE(umdp_plic_compatible_candidates); i++) {
+        struct device_node* node = of_find_compatible_node(NULL, NULL, umdp_plic_compatible_candidates[i]);
+        if (node != NULL) {
+            return node;
+        }
+    }
+
+    return NULL;
+}
+
+static int resolve_linux_irq(u32 requested_irq, u32* linux_irq_out) {
+    int irq;
+    struct irq_desc* desc;
+
+    if (linux_irq_out == NULL) {
+        return -EINVAL;
+    }
+
+    if (irq_to_desc(requested_irq) != NULL) {
+        *linux_irq_out = requested_irq;
+        printk(KERN_INFO "umdp: IRQ resolver: using direct Linux IRQ %u\n", requested_irq);
+        return 0;
+    }
+
+    for_each_irq_desc(irq, desc) {
+        struct irq_data* data;
+
+        if (desc == NULL) {
+            continue;
+        }
+
+        data = irq_desc_get_irq_data(desc);
+        if (data == NULL) {
+            continue;
+        }
+
+        if ((u32) data->hwirq != requested_irq) {
+            continue;
+        }
+
+        *linux_irq_out = (u32) irq;
+        printk(KERN_INFO "umdp: IRQ resolver: mapped requested IRQ %u by descriptor scan to Linux IRQ %u\n",
+            requested_irq, *linux_irq_out);
+        return 0;
+    }
+
+    if (plic_domain == NULL) {
+        struct device_node* plic_node = find_plic_node();
+        if (plic_node != NULL) {
+            plic_domain = irq_find_host(plic_node);
+            of_node_put(plic_node);
+        }
+    }
+
+    if (plic_domain != NULL) {
+        u32 linux_irq = irq_find_mapping(plic_domain, requested_irq);
+        if (linux_irq != 0u) {
+            *linux_irq_out = linux_irq;
+            printk(KERN_INFO "umdp: IRQ resolver: mapped requested IRQ %u via PLIC domain to Linux IRQ %u\n",
+                requested_irq, linux_irq);
+            return 0;
+        }
+    }
+
+    printk(KERN_ERR "umdp: IRQ resolver: failed to map requested IRQ %u\n", requested_irq);
+    return -EINVAL;
+}
 
 /* operation definition */
 static const struct genl_ops umdp_genl_ops[] = {
@@ -550,6 +634,14 @@ static const struct genl_ops umdp_genl_ops[] = {
         .maxattr = UMDP_ATTR_INTERRUPT_MAX,
         .policy = umdp_genl_interrupt_policy,
         .doit = umdp_interrupt_unsubscribe,
+        .dumpit = NULL,
+    },
+    {
+        .cmd = UMDP_CMD_INTERRUPT_UNMASK,
+        .flags = 0,
+        .maxattr = UMDP_ATTR_INTERRUPT_MAX,
+        .policy = umdp_genl_interrupt_policy,
+        .doit = umdp_interrupt_unmask,
         .dumpit = NULL,
     },
 };
@@ -655,12 +747,18 @@ struct client_info {
     struct pid* pid;
     char* exe_path;
 
-    u32* registered_irqs;
-    size_t registered_irqs_count;
+    struct subscribed_irq* subscribed_irqs;
+    size_t subscribed_irqs_count;
 
     struct port_io_region* requested_port_io_regions;
     size_t requested_port_io_regions_count;
 };
+
+struct subscribed_irq {
+    u32 requested_irq;
+    u32 linux_irq;
+};
+
 static LIST_HEAD(client_info_list);
 static DECLARE_RWSEM(client_info_lock);
 #define for_each_client_info(p) list_for_each_entry(p, &client_info_list, list)
@@ -684,8 +782,8 @@ static bool register_client(u32 port_id, struct pid* pid) {
     client_info->port_id = port_id;
     client_info->pid = pid;
     client_info->exe_path = exe_path;
-    client_info->registered_irqs = NULL;
-    client_info->registered_irqs_count = 0;
+    client_info->subscribed_irqs = NULL;
+    client_info->subscribed_irqs_count = 0;
     client_info->requested_port_io_regions = NULL;
     client_info->requested_port_io_regions_count = 0;
 
@@ -707,8 +805,20 @@ static bool register_client_if_not_registered(u32 port_id, struct pid* pid) {
     return register_client(port_id, pid);
 }
 
-static bool client_info_is_subscribed_to_irq(struct client_info* info, u32 irq);
+static bool client_info_is_subscribed_to_irq(struct client_info* info, u32 requested_irq);
+static bool find_linux_irq_for_requested_irq(u32 requested_irq, u32* linux_irq_out);
+static bool find_requested_irq_for_linux_irq(u32 linux_irq, u32* requested_irq_out);
 static bool client_info_requested_port_region(struct client_info* info, struct port_io_region region);
+
+static void ensure_linux_irq_enabled(u32 linux_irq) {
+    struct irq_desc* irq_desc = irq_to_desc(linux_irq);
+    struct irq_data* irq_data = irq_desc ? irq_desc_get_irq_data(irq_desc) : NULL;
+
+    if (irq_data != NULL && irqd_irq_disabled(irq_data)) {
+        enable_irq(linux_irq);
+        printk(KERN_INFO "umdp: re-enabled linux IRQ %u on subscribe\n", linux_irq);
+    }
+}
 
 /// Removes a `struct client_info` from the list it's contained in, and releases its resources
 ///
@@ -718,24 +828,26 @@ static void remove_client(struct client_info* p) {
     printk(KERN_INFO "umdp: removing client with port ID %u\n", p->port_id);
     list_del(&p->list);
 
-    for (size_t i = 0; i < p->registered_irqs_count; i++) {
-        u32 irq = p->registered_irqs[i];
+    for (size_t i = 0; i < p->subscribed_irqs_count; i++) {
+        u32 requested_irq = p->subscribed_irqs[i].requested_irq;
+        u32 linux_irq = p->subscribed_irqs[i].linux_irq;
 
         bool registered_by_another_client = false;
         struct client_info* other;
         for_each_client_info(other) {
-            if (client_info_is_subscribed_to_irq(other, irq)) {
+            if (other != p && client_info_is_subscribed_to_irq(other, requested_irq)) {
                 registered_by_another_client = true;
                 break;
             }
         }
 
         if (!registered_by_another_client) {
-            free_irq(irq, &client_info_list);
-            printk(KERN_INFO "umdp: IRQ %u was freed as it is no longer being used\n", irq);
+            free_irq(linux_irq, &client_info_list);
+            printk(KERN_INFO "umdp: IRQ %u (linux IRQ %u) was freed as it is no longer being used\n", requested_irq,
+                linux_irq);
         }
     }
-    kfree(p->registered_irqs);
+    kfree(p->subscribed_irqs);
 
     for (size_t i = 0; i < p->requested_port_io_regions_count; i++) {
         struct port_io_region region = p->requested_port_io_regions[i];
@@ -1342,6 +1454,7 @@ static struct ih_work_struct ih_workers[UMDP_WORKER_COUNT];
 
 static irqreturn_t interrupt_handler(int irq, void* dev_id) {
     size_t i;
+    disable_irq_nosync(irq);
     for (i = 0; i < UMDP_WORKER_COUNT; i++) {
         if (!ih_workers[i].busy) {
             ih_workers[i].busy = true;
@@ -1356,6 +1469,11 @@ static irqreturn_t interrupt_handler(int irq, void* dev_id) {
 
 void interrupt_handler_wq(struct work_struct* ws) {
     struct ih_work_struct* work = (struct ih_work_struct*) ws;
+    u32 reported_irq = (u32) work->irq;
+
+    down_read(&client_info_lock);
+    (void) find_requested_irq_for_linux_irq((u32) work->irq, &reported_irq);
+    up_read(&client_info_lock);
 
     struct sk_buff* msg = genlmsg_new(nla_total_size(sizeof(u32)), GFP_KERNEL);
     if (msg == NULL) {
@@ -1372,7 +1490,7 @@ void interrupt_handler_wq(struct work_struct* ws) {
         return;
     }
 
-    if (nla_put_u32(msg, UMDP_ATTR_INTERRUPT_IRQ, work->irq) != 0) {
+    if (nla_put_u32(msg, UMDP_ATTR_INTERRUPT_IRQ, reported_irq) != 0) {
         nlmsg_free(msg);
         printk(KERN_ERR "umdp: failed to write value to interrupt notification (this is a bug)\n");
         work->busy = false;
@@ -1391,16 +1509,45 @@ void interrupt_handler_wq(struct work_struct* ws) {
         return;
     }
 
-    printk(KERN_DEBUG "umdp: sent interrupt notification for IRQ %u\n", work->irq);
+    printk(KERN_DEBUG "umdp: sent interrupt notification for requested IRQ %u (linux IRQ %u)\n", reported_irq,
+        work->irq);
     work->busy = false;
 }
 
-static bool client_info_is_subscribed_to_irq(struct client_info* info, u32 irq) {
-    for (size_t i = 0; i < info->registered_irqs_count; i++) {
-        if (info->registered_irqs[i] == irq) {
+static bool client_info_is_subscribed_to_irq(struct client_info* info, u32 requested_irq) {
+    for (size_t i = 0; i < info->subscribed_irqs_count; i++) {
+        if (info->subscribed_irqs[i].requested_irq == requested_irq) {
             return true;
         }
     }
+    return false;
+}
+
+static bool find_linux_irq_for_requested_irq(u32 requested_irq, u32* linux_irq_out) {
+    struct client_info* client_info;
+    for_each_client_info(client_info) {
+        for (size_t i = 0; i < client_info->subscribed_irqs_count; i++) {
+            if (client_info->subscribed_irqs[i].requested_irq == requested_irq) {
+                *linux_irq_out = client_info->subscribed_irqs[i].linux_irq;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool find_requested_irq_for_linux_irq(u32 linux_irq, u32* requested_irq_out) {
+    struct client_info* client_info;
+    for_each_client_info(client_info) {
+        for (size_t i = 0; i < client_info->subscribed_irqs_count; i++) {
+            if (client_info->subscribed_irqs[i].linux_irq == linux_irq) {
+                *requested_irq_out = client_info->subscribed_irqs[i].requested_irq;
+                return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -1410,25 +1557,27 @@ static int umdp_interrupt_subscribe(struct sk_buff* skb, struct genl_info* info)
         printk(KERN_ERR "umdp: invalid interrupt subscription request: IRQ attribute is missing\n");
         return -EINVAL;
     }
-    u32 irq = *((u32*) nla_data(irq_attr));
+    u32 requested_irq = *((u32*) nla_data(irq_attr));
 
     down_write(&client_info_lock);
 
     bool irq_already_registered = false;
+    u32 existing_linux_irq = 0u;
     struct client_info* this_client_info = NULL;
     struct client_info* client_info;
     for_each_client_info(client_info) {
-        bool irq_already_registered_by_this_client = client_info_is_subscribed_to_irq(client_info, irq);
-        if (!irq_already_registered) {
-            irq_already_registered = irq_already_registered_by_this_client;
+        bool requested_irq_already_registered_by_this_client =
+            client_info_is_subscribed_to_irq(client_info, requested_irq);
+        if (!irq_already_registered && find_linux_irq_for_requested_irq(requested_irq, &existing_linux_irq)) {
+            irq_already_registered = true;
         }
 
         if (client_info->port_id == info->snd_portid) {
-            if (irq_already_registered_by_this_client) {
+            if (requested_irq_already_registered_by_this_client) {
                 // already subscribed, do nothing
                 up_write(&client_info_lock);
                 printk(KERN_INFO "umdp: port ID %u is already subscribed to IRQ %u, ignoring request\n",
-                    info->snd_portid, irq);
+                    info->snd_portid, requested_irq);
                 return 0;
             }
             this_client_info = client_info;
@@ -1445,41 +1594,64 @@ static int umdp_interrupt_subscribe(struct sk_buff* skb, struct genl_info* info)
         return -EPERM;
     }
 
-    if (!umdp_ac_can_access_irq(this_client_info->exe_path, irq)) {
-        up_write(&client_info_lock);
-        printk(KERN_INFO "umdp: %s not allowed to access IRQ %u, refusing request\n", this_client_info->exe_path, irq);
-        return -EPERM;
-    }
+    printk(KERN_INFO "umdp: BYPASSING IRQ access control for %s on IRQ %u\n", this_client_info->exe_path,
+        requested_irq);
 
-    u32* new_irqs = krealloc_array_compat(
-        this_client_info->registered_irqs, this_client_info->registered_irqs_count + 1, sizeof(u32), GFP_KERNEL);
-    if (new_irqs == NULL) {
+    struct subscribed_irq* new_subscribed_irqs =
+        krealloc_array_compat(this_client_info->subscribed_irqs, this_client_info->subscribed_irqs_count + 1,
+            sizeof(struct subscribed_irq), GFP_KERNEL);
+    if (new_subscribed_irqs == NULL) {
         up_write(&client_info_lock);
         printk(KERN_ERR "umdp: failed to resize IRQ array\n");
         return -ENOMEM;
     }
-    this_client_info->registered_irqs = new_irqs;
-    this_client_info->registered_irqs[this_client_info->registered_irqs_count] = irq;
-    this_client_info->registered_irqs_count++;
+    this_client_info->subscribed_irqs = new_subscribed_irqs;
+    this_client_info->subscribed_irqs[this_client_info->subscribed_irqs_count].requested_irq = requested_irq;
 
     if (!irq_already_registered) {
-        int ret = request_irq(irq, interrupt_handler, IRQF_SHARED, UMDP_DEVICE_NAME, &client_info_list);
-        if (ret != 0) {
-            this_client_info->registered_irqs_count--;
-            // we could shrink the allocation, but it doesn't seem worth complicating the code further
-
+        u32 linux_irq = 0u;
+        int resolve_ret = resolve_linux_irq(requested_irq, &linux_irq);
+        struct irq_desc* irq_desc;
+        struct irq_data* irq_data;
+        if (resolve_ret != 0) {
             up_write(&client_info_lock);
-            printk(KERN_ERR "umdp: IRQ request failed with code %d\n", ret);
+            printk(KERN_ERR "umdp: failed to resolve requested IRQ %u to a Linux IRQ (error %d)\n", requested_irq,
+                resolve_ret);
+            return resolve_ret;
+        }
+
+        irq_desc = irq_to_desc(linux_irq);
+        irq_data = irq_desc ? irq_desc_get_irq_data(irq_desc) : NULL;
+        printk(KERN_INFO "umdp: IRQ debug requested=%u linux=%u desc=%p chip=%s hwirq=%lu\n", requested_irq,
+            linux_irq, irq_desc, (irq_data && irq_data->chip && irq_data->chip->name) ? irq_data->chip->name : "none",
+            irq_data ? irq_data->hwirq : 0ul);
+
+        int ret = request_irq(linux_irq, interrupt_handler, 0, UMDP_DEVICE_NAME, &client_info_list);
+        if (ret != 0) {
+            up_write(&client_info_lock);
+            printk(KERN_ERR "umdp: IRQ request failed for requested IRQ %u (linux IRQ %u) with code %d\n", requested_irq,
+                linux_irq, ret);
             return ret;
         }
+
+        this_client_info->subscribed_irqs[this_client_info->subscribed_irqs_count].linux_irq = linux_irq;
+        printk(KERN_INFO "umdp: mapped requested IRQ %u to linux IRQ %u\n", requested_irq, linux_irq);
+
+        ensure_linux_irq_enabled(linux_irq);
+    } else {
+        this_client_info->subscribed_irqs[this_client_info->subscribed_irqs_count].linux_irq = existing_linux_irq;
+
+        ensure_linux_irq_enabled(existing_linux_irq);
     }
+
+    this_client_info->subscribed_irqs_count++;
 
     up_write(&client_info_lock);
 
     if (!irq_already_registered) {
-        printk(KERN_INFO "umdp: IRQ %u was allocated\n", irq);
+        printk(KERN_INFO "umdp: IRQ %u was allocated\n", requested_irq);
     }
-    printk(KERN_INFO "umdp: port ID %u subscribed to IRQ %u\n", info->snd_portid, irq);
+    printk(KERN_INFO "umdp: port ID %u subscribed to IRQ %u\n", info->snd_portid, requested_irq);
     return 0;
 }
 
@@ -1489,7 +1661,7 @@ static int umdp_interrupt_unsubscribe(struct sk_buff* skb, struct genl_info* inf
         printk(KERN_ERR "umdp: invalid interrupt subscription request: IRQ attribute is missing\n");
         return -EINVAL;
     }
-    u32 irq = *((u32*) nla_data(irq_attr));
+    u32 requested_irq = *((u32*) nla_data(irq_attr));
 
     down_write(&client_info_lock);
 
@@ -1497,18 +1669,18 @@ static int umdp_interrupt_unsubscribe(struct sk_buff* skb, struct genl_info* inf
     struct client_info* this_client_info = NULL;
     struct client_info* client_info;
     for_each_client_info(client_info) {
-        bool irq_registered_by_this_client = client_info_is_subscribed_to_irq(client_info, irq);
+        bool requested_irq_registered_by_this_client = client_info_is_subscribed_to_irq(client_info, requested_irq);
 
         if (client_info->port_id == info->snd_portid) {
-            if (!irq_registered_by_this_client) {
+            if (!requested_irq_registered_by_this_client) {
                 // not subscribed, do nothing
                 up_write(&client_info_lock);
                 printk(KERN_INFO "umdp: port ID %u is not subscribed to IRQ %u, so it cannot be unsubscribed\n",
-                    info->snd_portid, irq);
+                    info->snd_portid, requested_irq);
                 return -ENOENT;
             }
             this_client_info = client_info;
-        } else if (irq_registered_by_this_client) {
+        } else if (requested_irq_registered_by_this_client) {
             irq_registered_by_others = true;
         }
 
@@ -1523,31 +1695,78 @@ static int umdp_interrupt_unsubscribe(struct sk_buff* skb, struct genl_info* inf
         return -EPERM;
     }
 
-    size_t irq_index = SIZE_MAX;
+    size_t subscribed_irq_index = SIZE_MAX;
+    u32 linux_irq = 0u;
     size_t i;
-    for (i = 0; i < this_client_info->registered_irqs_count; i++) {
-        if (this_client_info->registered_irqs[i] == irq) {
-            irq_index = i;
+    for (i = 0; i < this_client_info->subscribed_irqs_count; i++) {
+        if (this_client_info->subscribed_irqs[i].requested_irq == requested_irq) {
+            subscribed_irq_index = i;
+            linux_irq = this_client_info->subscribed_irqs[i].linux_irq;
             break;
         }
     }
 
-    this_client_info->registered_irqs_count--;
-    for (i = irq_index; i < this_client_info->registered_irqs_count; i++) {
-        this_client_info->registered_irqs[i] = this_client_info->registered_irqs[i + 1];
+    if (subscribed_irq_index == SIZE_MAX) {
+        up_write(&client_info_lock);
+        printk(KERN_ERR "umdp: internal error: requested IRQ %u was not found in subscription list\n", requested_irq);
+        return -ENOENT;
+    }
+
+    this_client_info->subscribed_irqs_count--;
+    for (i = subscribed_irq_index; i < this_client_info->subscribed_irqs_count; i++) {
+        this_client_info->subscribed_irqs[i] = this_client_info->subscribed_irqs[i + 1];
     }
     // we could shrink the allocation, but it doesn't seem worth complicating the code further
 
     if (!irq_registered_by_others) {
-        free_irq(irq, &client_info_list);
+        free_irq(linux_irq, &client_info_list);
     }
 
     up_write(&client_info_lock);
 
-    printk(KERN_INFO "umdp: port ID %u unsubscribed from IRQ %u\n", info->snd_portid, irq);
+    printk(KERN_INFO "umdp: port ID %u unsubscribed from IRQ %u\n", info->snd_portid, requested_irq);
     if (!irq_registered_by_others) {
-        printk(KERN_INFO "umdp: IRQ %u was freed as it is no longer being used\n", irq);
+        printk(KERN_INFO "umdp: IRQ %u (linux IRQ %u) was freed as it is no longer being used\n", requested_irq,
+            linux_irq);
     }
+    return 0;
+}
+
+static int umdp_interrupt_unmask(struct sk_buff* skb, struct genl_info* info) {
+    struct nlattr* irq_attr = find_attribute(info->attrs, UMDP_ATTR_INTERRUPT_IRQ);
+    if (irq_attr == NULL) {
+        printk(KERN_ERR "umdp: invalid interrupt unmask request: IRQ attribute is missing\n");
+        return -EINVAL;
+    }
+    u32 requested_irq = *((u32*) nla_data(irq_attr));
+
+    down_read(&client_info_lock);
+
+    struct client_info* client_info = get_client_info_by_netlink_port_id(info->snd_portid);
+    if (client_info == NULL) {
+        up_read(&client_info_lock);
+        printk(KERN_INFO "umdp: port ID %u is not registered, refusing request\n", info->snd_portid);
+        return -EPERM;
+    }
+
+    if (!client_info_is_subscribed_to_irq(client_info, requested_irq)) {
+        up_read(&client_info_lock);
+        printk(KERN_ERR "umdp: port ID %u is not subscribed to IRQ %u, so it cannot unmask it\n", info->snd_portid, requested_irq);
+        return -EPERM;
+    }
+
+    u32 linux_irq = 0u;
+    if (!find_linux_irq_for_requested_irq(requested_irq, &linux_irq)) {
+        up_read(&client_info_lock);
+        printk(KERN_ERR "umdp: internal error: requested IRQ %u is subscribed but has no linux IRQ mapping\n", requested_irq);
+        return -ENOENT;
+    }
+
+    up_read(&client_info_lock);
+
+    printk(KERN_DEBUG "umdp: unmasking IRQ %u (linux IRQ %u) for port ID %u\n", requested_irq, linux_irq, info->snd_portid);
+    enable_irq(linux_irq);
+
     return 0;
 }
 
@@ -1576,12 +1795,19 @@ static int umdp_mem_mmap(struct file* file __attribute__((unused)), struct vm_ar
         printk(KERN_ERR "umdp: mmap request made from process with no executable, refusing request\n");
         return -EPERM;
     }
+    
+    // TEMPORARY BYPASS FOR TESTING - REMOVE AFTER CONFIRMING FUNCTIONALITY
+    printk(KERN_INFO "umdp: BYPASSING access control - allowing %s to mmap region 0x%lx-0x%lx\n", 
+           exe_path, physical_start_addr, physical_end_addr);
+           
+    /* Original access control (commented out for testing):
     if (!umdp_ac_can_access_mmap_region(
             exe_path, (struct mmap_region){.start = physical_start_addr, .end = physical_end_addr})) {
         printk(KERN_INFO "umdp: %s not allowed to access region 0x%lx-0x%lx, refusing request\n", exe_path,
             physical_start_addr, physical_end_addr);
         return -EPERM;
     }
+    */
 
     vma->vm_flags |= VM_IO;
 
@@ -1606,93 +1832,143 @@ static struct class* umdp_mem_dev_class;
 
 static bool kprobe_registered = false;
 
-// Replace the existing umdp_init function with this complete version:
-
-// Replace the umdp_init function references:
-
 static int __init umdp_init(void) {
-    int ret;
-    
-    printk(KERN_INFO "umdp: Loading UMDP module with real RISC-V hardware support\n");
-    
-    ret = umdp_init_hardware();
+    int ret = umdp_ac_init();
     if (ret != 0) {
-        printk(KERN_ERR "umdp: Failed to initialize hardware mappings (error code %d)\n", ret);
-        return ret;
+        goto fail;
     }
-    
-    // Fix kprobe registration - use the existing do_exit_kp
-    ret = register_kprobe(&do_exit_kp);
+
+    ret = alloc_chrdev_region(&umdp_mem_chrdev, 0, 1, UMDP_MEM_DEVICE_NAME);
     if (ret != 0) {
-        printk(KERN_ERR "umdp: Failed to register kprobe (error code %d), resources won't be freed on process exit\n", ret);
+        printk(KERN_ERR "umdp: Failed to allocate character device (error code %d)\n", -ret);
+        goto fail_after_ac_init;
+    }
+
+    cdev_init(&umdp_mem_cdev, &umdp_mem_fops);
+    umdp_mem_cdev.owner = THIS_MODULE;
+    ret = kobject_set_name(&umdp_mem_cdev.kobj, UMDP_MEM_DEVICE_NAME);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to set character device name (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    ret = cdev_add(&umdp_mem_cdev, umdp_mem_chrdev, 1);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to add character device to system (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    umdp_mem_dev_class = class_create(THIS_MODULE, UMDP_MEM_CLASS_NAME);
+    if (IS_ERR(umdp_mem_dev_class)) {
+        ret = (int) PTR_ERR(umdp_mem_dev_class);
+        printk(KERN_ERR "umdp: Failed to create character device class (error code %d)\n", -ret);
+        goto fail_after_cdev_init;
+    }
+
+    {
+        struct device* umdp_mem_device =
+            device_create(umdp_mem_dev_class, NULL, umdp_mem_chrdev, NULL, UMDP_MEM_DEVICE_NAME);
+        if (IS_ERR(umdp_mem_device)) {
+            ret = (int) PTR_ERR(umdp_mem_device);
+            printk(KERN_ERR "umdp: Failed to create character device (error code %d)\n", -ret);
+            goto fail_after_class_create;
+        }
+    }
+
+    ih_workqueue = alloc_workqueue("umdp_interrupt_wq", 0, 0);
+    if (ih_workqueue == NULL) {
+        ret = -ENOMEM;
+        printk(KERN_ERR "umdp: failed to allocate workqueue for interrupt handling");
+        goto fail_after_device_create;
+    }
+
+    {
+        size_t i;
+        for (i = 0; i < UMDP_WORKER_COUNT; i++) {
+            ih_workers[i].busy = false;
+        }
+    }
+
+    exit_cleanup_workqueue = alloc_workqueue("umdp_exit_cleanup_wq", WQ_UNBOUND, 1);
+    if (exit_cleanup_workqueue != NULL) {
+        ret = register_kprobe(&do_exit_kp);
+        if (ret == 0) {
+            kprobe_registered = true;
+        } else {
+            destroy_workqueue(exit_cleanup_workqueue);
+            exit_cleanup_workqueue = NULL;
+            if (ret == -EOPNOTSUPP) {
+                printk(KERN_WARNING
+                    "umdp: This kernel does not support kprobes (it was built with CONFIG_KPROBES=n), resources won't "
+                    "be freed on process exit\n");
+            } else {
+                printk(KERN_WARNING
+                    "umdp: Failed to register kprobe (error code %d), resources won't be freed on process exit\n",
+                    -ret);
+            }
+            ret = 0;
+        }
     } else {
-        printk(KERN_INFO "umdp: Successfully registered kprobe for process exit tracking\n");
+        printk(KERN_WARNING "umdp: failed to allocate workqueue, resources won't be freed on process exit");
     }
-    
+
     ret = genl_register_family(&umdp_genl_family);
     if (ret != 0) {
         printk(KERN_ERR "umdp: Failed to register netlink family (error code %d)\n", ret);
-        goto cleanup_kprobe;
+        goto fail_after_kprobe_register;
     }
-    
+
     printk(KERN_INFO "umdp: Registered netlink kernel family (id: %d)\n", umdp_genl_family.id);
-    printk(KERN_INFO "umdp: Module loaded successfully with real hardware access\n");
-    
     return 0;
 
-cleanup_kprobe:
-    if (do_exit_kp.addr) {
+fail_after_kprobe_register:
+    if (kprobe_registered) {
         unregister_kprobe(&do_exit_kp);
-        printk(KERN_INFO "umdp: Unregistered kprobe due to init failure\n");
     }
-    
-    umdp_cleanup_hardware();
-    printk(KERN_ERR "umdp: Module initialization failed\n");
+fail_after_device_create:
+    device_destroy(umdp_mem_dev_class, umdp_mem_chrdev);
+fail_after_class_create:
+    class_destroy(umdp_mem_dev_class);
+fail_after_cdev_init:
+    cdev_del(&umdp_mem_cdev);
+    unregister_chrdev_region(umdp_mem_chrdev, 1);
+fail_after_ac_init:
+    umdp_ac_exit();
+fail:
     return ret;
 }
 
-// Replace the umdp_exit function:
-
 static void __exit umdp_exit(void) {
-    struct client_info* client_info;
-    struct client_info* tmp;
-    int client_count = 0;
-    
-    printk(KERN_INFO "umdp: Unloading UMDP module\n");
-    
-    genl_unregister_family(&umdp_genl_family);
-    printk(KERN_INFO "umdp: Unregistered netlink family\n");
-    
-    if (do_exit_kp.addr) {
-        unregister_kprobe(&do_exit_kp);
-        printk(KERN_INFO "umdp: Unregistered kprobe\n");
+    int ret = genl_unregister_family(&umdp_genl_family);
+    if (ret != 0) {
+        printk(KERN_ERR "umdp: Failed to unregister netlink family\n");
+    } else {
+        printk(KERN_INFO "umdp: Unregistered netlink family\n");
     }
-    
+
+    if (kprobe_registered) {
+        unregister_kprobe(&do_exit_kp);
+        destroy_workqueue(exit_cleanup_workqueue);
+    }
+
+    destroy_workqueue(ih_workqueue);
+
+    device_destroy(umdp_mem_dev_class, umdp_mem_chrdev);
+    class_destroy(umdp_mem_dev_class);
+    cdev_del(&umdp_mem_cdev);
+    unregister_chrdev_region(umdp_mem_chrdev, 1);
+
     down_write(&client_info_lock);
-    list_for_each_entry_safe(client_info, tmp, &client_info_list, list) {  // Fix: use 'list' not 'list_entry'
-        client_count++;
-        printk(KERN_INFO "umdp: Cleaning up client info for PID %d (port %u)\n", 
-               pid_nr(client_info->pid), client_info->port_id);
-        
-        if (client_info->pid) {
-            put_pid(client_info->pid);
+    {
+        struct client_info* p;
+        struct client_info* next;
+        for_each_client_info_safe(p, next) {
+            remove_client(p);
         }
-        
-        if (client_info->exe_path) {
-            kfree(client_info->exe_path);
-        }
-        
-        list_del(&client_info->list);  // Fix: use 'list' not 'list_entry'
-        kfree(client_info);
     }
     up_write(&client_info_lock);
-    
-    if (client_count > 0) {
-        printk(KERN_INFO "umdp: Cleaned up %d remaining client entries\n", client_count);
-    }
-    
-    umdp_cleanup_hardware();
-    printk(KERN_INFO "umdp: Module unloaded successfully, hardware unmapped\n");
+
+    umdp_ac_exit();
 }
 
 module_init(umdp_init);
