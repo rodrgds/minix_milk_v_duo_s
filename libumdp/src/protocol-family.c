@@ -129,6 +129,12 @@ static struct genl_cmd umdp_cmds[] = {
         .c_maxattr = UMDP_ATTR_INTERRUPT_MAX,
         .c_attr_policy = umdp_genl_interrupt_policy,
     },
+    {
+        .c_id = UMDP_CMD_INTERRUPT_UNMASK,
+        .c_name = "UMDP_CMD_INTERRUPT_UNMASK",
+        .c_maxattr = UMDP_ATTR_INTERRUPT_MAX,
+        .c_attr_policy = umdp_genl_interrupt_policy,
+    },
 };
 
 struct genl_ops umdp_family = {

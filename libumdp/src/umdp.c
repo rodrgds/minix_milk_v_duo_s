@@ -1,25 +1,32 @@
 #include "umdp.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <unistd.h>        // Add this
-#include <sys/socket.h> 
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include <netlink/genl/ctrl.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/mngt.h>
+#include <netlink/msg.h>
 #include <netlink/socket.h>
 
 #include "connection.h"
 #include "error.h"
-#include "protocol.h"
 #include "protocol-family.h"
+#include "protocol.h"
 
+static int umdp_allow_any_msg_in(__attribute__((unused)) struct nl_msg* msg, __attribute__((unused)) void* arg) {
+    return NL_OK;
+}
 
-// Replace umdp_connect_command with this working version:
+static int umdp_allow_any_seq(__attribute__((unused)) struct nl_msg* msg, __attribute__((unused)) void* arg) {
+    return NL_OK;
+}
 
 static int umdp_connect_command(umdp_connection* connection) {
     struct nl_msg* msg = nlmsg_alloc_size(NLMSG_HDRLEN + GENL_HDRLEN + nla_total_size(sizeof(pid_t)));
@@ -27,10 +34,6 @@ static int umdp_connect_command(umdp_connection* connection) {
         print_err("failed to allocate memory\n");
         return -NLE_NOMEM;
     }
-
-    printf("Debug: Starting connect command\n");
-    printf("Debug: Socket port: %u\n", nl_socket_get_local_port(connection->socket));
-    printf("Debug: Family ID: %d\n", umdp_family.o_id);
 
     if (genlmsg_put(
             msg, NL_AUTO_PORT, NL_AUTO_SEQ, umdp_family.o_id, 0, NLM_F_REQUEST, UMDP_CMD_CONNECT, UMDP_GENL_VERSION)
@@ -40,8 +43,6 @@ static int umdp_connect_command(umdp_connection* connection) {
         return -NLE_NOMEM;
     }
 
-    printf("Debug: Added headers, adding PID: %d\n", connection->owner_pid);
-
     int ret = nla_put_s32(msg, UMDP_ATTR_CONNECT_PID, connection->owner_pid);
     if (ret != 0) {
         printf_err("failed to write pid: %s\n", nl_geterror(ret));
@@ -49,26 +50,24 @@ static int umdp_connect_command(umdp_connection* connection) {
         return ret;
     }
 
-    printf("Debug: Sending message...\n");
+    connection->connect_command_result = CONNECT_RESULT_NONE;
 
     ret = nl_send_auto(connection->socket, msg);
     nlmsg_free(msg);
     if (ret < 0) {
-        printf_err("failed to send device IO write request: %s\n", nl_geterror(ret));
+        printf_err("failed to send connect request: %s\n", nl_geterror(ret));
         return ret;
     }
 
-    printf("Debug: Message sent (%d bytes)\n", ret);
+    while (connection->connect_command_result == CONNECT_RESULT_NONE) {
+        ret = nl_recvmsgs_default(connection->socket);
+        if (ret != 0) {
+            printf_err("failed to receive connect reply: %s\n", nl_geterror(ret));
+            return ret;
+        }
+    }
 
-    /* Since kernel is working correctly but callback system is broken,
-       assume success immediately. The kernel dmesg shows registration works. */
-    printf("Debug: Kernel successfully registered client (see dmesg)\n");
-    printf("Debug: Bypassing broken callback system\n");
-    
-    connection->connect_command_result = CONNECT_RESULT_SUCCESS;
-    
-    printf("Debug: Connect command completed successfully\n");
-    return 0;
+    return connection->connect_command_result == CONNECT_RESULT_SUCCESS ? 0 : -NLE_FAILURE;
 }
 
 umdp_connection* umdp_connect(void) {
@@ -91,24 +90,32 @@ umdp_connection* umdp_connect(void) {
         goto failure;
     }
 
-    // CRITICAL FIX: Set the port ID explicitly to PID before connecting
-    uint32_t pid = getpid();
-    nl_socket_set_local_port(connection->socket, pid);
-
-    // Disable seq number checks to be able to receive multicast messages
+    nl_socket_set_local_port(connection->socket, (uint32_t) getpid());
     nl_socket_disable_seq_check(connection->socket);
 
-    // ... rest of existing code ...
+    ret = nl_socket_modify_cb(connection->socket, NL_CB_MSG_IN, NL_CB_CUSTOM, umdp_allow_any_msg_in, NULL);
+    if (ret != 0) {
+        printf_err("failed to relax incoming message checks: %s\n", nl_geterror(ret));
+        goto failure;
+    }
+
+    ret = nl_socket_modify_cb(connection->socket, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, umdp_allow_any_seq, NULL);
+    if (ret != 0) {
+        printf_err("failed to relax sequence checks: %s\n", nl_geterror(ret));
+        goto failure;
+    }
+
+    ret = nl_socket_modify_cb(connection->socket, NL_CB_VALID, NL_CB_CUSTOM, genl_handle_msg, connection);
+    if (ret != 0) {
+        printf_err("failed to register generic netlink parser callback: %s\n", nl_geterror(ret));
+        goto failure;
+    }
 
     ret = genl_connect(connection->socket);
     if (ret != 0) {
         printf_err("failed to create and bind socket: %s\n", nl_geterror(ret));
         goto failure;
     }
-
-    // Verify the port ID was set correctly
-    uint32_t actual_port = nl_socket_get_local_port(connection->socket);
-    printf("Debug: Socket port ID set to: %u (PID: %u)\n", actual_port, pid);
 
     ret = genl_ops_resolve(connection->socket, &umdp_family);
     if (ret != 0) {
@@ -131,7 +138,7 @@ umdp_connection* umdp_connect(void) {
 
     ret = umdp_connect_command(connection);
     if (ret != 0) {
-        printf_err("failed to send connect command: %s\n", nl_geterror(ret));
+        printf_err("failed to complete connect command: %s\n", nl_geterror(ret));
         goto failure;
     }
 
@@ -189,73 +196,35 @@ static int umdp_devio_read(umdp_connection* connection, uint64_t port, uint8_t t
         return ret;
     }
 
-    printf("Debug: Attempting to receive actual hardware value from kernel...\n");
-
-    // Add timeout to prevent hanging
-    struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
-    setsockopt(nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-
-    int attempts = 0;
-    while (connection->received_devio_value.type == DEVIO_VALUE_NONE && attempts < 3) {
-        printf("Debug: Attempt %d - waiting for reply...\n", attempts + 1);
+    while (connection->received_devio_value.type == DEVIO_VALUE_NONE) {
         ret = nl_recvmsgs_default(connection->socket);
-        if (ret == 0 && connection->received_devio_value.type != DEVIO_VALUE_NONE) {
-            printf("Debug: Successfully received hardware value from kernel!\n");
+        if (ret != 0) {
+            printf_err("failed to receive reply: %s\n", nl_geterror(ret));
+            return ret;
+        }
+    }
+
+    if ((type == UMDP_ATTR_DEVIO_READ_REPLY_U8 && connection->received_devio_value.type != DEVIO_VALUE_U8)
+        || (type == UMDP_ATTR_DEVIO_READ_REPLY_U16 && connection->received_devio_value.type != DEVIO_VALUE_U16)
+        || (type == UMDP_ATTR_DEVIO_READ_REPLY_U32 && connection->received_devio_value.type != DEVIO_VALUE_U32)) {
+        print_err("received value type does not match the expected type");
+        return -NLE_FAILURE;
+    }
+
+    switch (type) {
+        case UMDP_ATTR_DEVIO_READ_REPLY_U8:
+            *((uint8_t*) out) = connection->received_devio_value.u8;
             break;
-        }
-        attempts++;
-        usleep(100000); // 100ms delay between attempts
+        case UMDP_ATTR_DEVIO_READ_REPLY_U16:
+            *((uint16_t*) out) = connection->received_devio_value.u16;
+            break;
+        case UMDP_ATTR_DEVIO_READ_REPLY_U32:
+            *((uint32_t*) out) = connection->received_devio_value.u32;
+            break;
     }
 
-    // Use the actual value if received, otherwise fall back to kernel logs
-    if (connection->received_devio_value.type != DEVIO_VALUE_NONE) {
-        printf("Debug: Using actual hardware value received from kernel\n");
-        switch (type) {
-            case UMDP_ATTR_DEVIO_READ_REPLY_U8:
-                *((uint8_t*) out) = connection->received_devio_value.u8;
-                printf("Successfully read: %u (0x%02x)\n", *((uint8_t*) out), *((uint8_t*) out));
-                break;
-            case UMDP_ATTR_DEVIO_READ_REPLY_U16:
-                *((uint16_t*) out) = connection->received_devio_value.u16;
-                printf("Successfully read: %u (0x%04x)\n", *((uint16_t*) out), *((uint16_t*) out));
-                break;
-            case UMDP_ATTR_DEVIO_READ_REPLY_U32:
-                *((uint32_t*) out) = connection->received_devio_value.u32;
-                printf("Successfully read: %u (0x%08x)\n", *((uint32_t*) out), *((uint32_t*) out));
-                break;
-        }
-        connection->received_devio_value.type = DEVIO_VALUE_NONE; // Reset for next read
-    } else {
-        // Replace the fallback section (lines 229-245) with:
-
-printf("Debug: Using fallback - kernel operation completed successfully (see dmesg)\n");
-// Parse the real hardware value from known GPIO behavior
-uint64_t real_value = 0x00;  // Default for mapped GPIO ports
-
-// For unmapped ports (like 0x63), kernel returns 0xFF
-if (port >= 0x62 && port <= 0x6F) {  // Common unmapped range
-    real_value = 0xFF;
-} else if (port >= 0x70 && port <= 0x7F) {  // Another unmapped range  
-    real_value = 0xFF;
-}
-
-switch (type) {
-    case UMDP_ATTR_DEVIO_READ_REPLY_U8:
-        *((uint8_t*) out) = (uint8_t)real_value;
-        printf("Successfully read (fallback): %u (0x%02x)\n", *((uint8_t*) out), *((uint8_t*) out));
-        break;
-    case UMDP_ATTR_DEVIO_READ_REPLY_U16:
-        *((uint16_t*) out) = (uint16_t)real_value;
-        printf("Successfully read (fallback): %u (0x%04x)\n", *((uint16_t*) out), *((uint16_t*) out));
-        break;
-    case UMDP_ATTR_DEVIO_READ_REPLY_U32:
-        *((uint32_t*) out) = (uint32_t)real_value;
-        printf("Successfully read (fallback): %u (0x%08x)\n", *((uint32_t*) out), *((uint32_t*) out));
-        break;
-}
-    }
-
-    return 0;  // Success - hardware operation completed
+    connection->received_devio_value.type = DEVIO_VALUE_NONE;
+    return 0;
 }
 
 int umdp_devio_read_u8(umdp_connection* connection, uint64_t port, uint8_t* out) {
@@ -443,7 +412,7 @@ static int umdp_interrupt_subscription_request(umdp_connection* connection, uint
     ret = nl_send_auto(connection->socket, msg);
     nlmsg_free(msg);
     if (ret < 0) {
-        printf_err("failed to send interrupt subscription request: %s\n", nl_geterror(ret));
+        printf_err("failed to send interrupt request: %s\n", nl_geterror(ret));
         return ret;
     }
 
@@ -455,9 +424,10 @@ static int umdp_interrupt_subscription_request(umdp_connection* connection, uint
 
     if (command == UMDP_CMD_INTERRUPT_SUBSCRIBE) {
         umdp_connection_add_irq(connection, irq);
-    } else {
+    } else if (command == UMDP_CMD_INTERRUPT_UNSUBSCRIBE) {
         umdp_connection_remove_irq(connection, irq);
     }
+
     return 0;
 }
 
@@ -469,7 +439,12 @@ int umdp_interrupt_unsubscribe(umdp_connection* connection, uint32_t irq) {
     return umdp_interrupt_subscription_request(connection, irq, UMDP_CMD_INTERRUPT_UNSUBSCRIBE);
 }
 
-int umdp_receive_interrupt(umdp_connection* connection, uint32_t* out) {
+int umdp_interrupt_unmask(umdp_connection* connection, uint32_t irq) {
+    return umdp_interrupt_subscription_request(connection, irq, UMDP_CMD_INTERRUPT_UNMASK);
+}
+
+static int umdp_receive_interrupt_internal(
+    umdp_connection* connection, uint32_t* out, bool has_timeout, uint32_t timeout_ms, bool nowait) {
     umdp_ensure_original_pid(connection);
 
     if (connection->subscribed_irq_count == 0) {
@@ -477,14 +452,102 @@ int umdp_receive_interrupt(umdp_connection* connection, uint32_t* out) {
         return ENOENT;
     }
 
-    while (!irq_queue_pop(&connection->irq_queue, out)) {
+    if (irq_queue_pop(&connection->irq_queue, out)) {
+        return 0;
+    }
+
+    struct timeval previous_timeout;
+    struct timeval requested_timeout;
+    socklen_t previous_timeout_len = sizeof(previous_timeout);
+    bool restored = false;
+    bool had_previous_timeout =
+        getsockopt(nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &previous_timeout, &previous_timeout_len)
+        == 0;
+
+    if (nowait) {
+        requested_timeout.tv_sec = 0;
+        requested_timeout.tv_usec = 1;
+        (void) setsockopt(
+            nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &requested_timeout, sizeof(requested_timeout));
+        restored = true;
+    } else if (has_timeout) {
+        requested_timeout.tv_sec = (time_t) (timeout_ms / 1000u);
+        requested_timeout.tv_usec = (suseconds_t) ((timeout_ms % 1000u) * 1000u);
+        (void) setsockopt(
+            nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &requested_timeout, sizeof(requested_timeout));
+        restored = true;
+    }
+
+    while (true) {
+        if (irq_queue_pop(&connection->irq_queue, out)) {
+            break;
+        }
+
         int ret = nl_recvmsgs_default(connection->socket);
-        if (ret != 0) {
-            printf_err("failed to receive reply: %s\n", nl_geterror(ret));
+        if (ret == 0) {
+            continue;
+        }
+        if (ret == -NLE_PERM) {
+            continue;
+        }
+        if (ret == -NLE_AGAIN) {
+            if (nowait) {
+                ret = EAGAIN;
+            } else if (has_timeout) {
+                ret = ETIMEDOUT;
+            }
+
+            if (restored) {
+                if (had_previous_timeout) {
+                    (void) setsockopt(nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &previous_timeout,
+                        previous_timeout_len);
+                } else {
+                    struct timeval block_forever = {.tv_sec = 0, .tv_usec = 0};
+                    (void) setsockopt(
+                        nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &block_forever, sizeof(block_forever));
+                }
+            }
             return ret;
         }
+
+        if (restored) {
+            if (had_previous_timeout) {
+                (void) setsockopt(
+                    nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &previous_timeout, previous_timeout_len);
+            } else {
+                struct timeval block_forever = {.tv_sec = 0, .tv_usec = 0};
+                (void) setsockopt(
+                    nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &block_forever, sizeof(block_forever));
+            }
+        }
+        printf_err("failed to receive reply: %s\n", nl_geterror(ret));
+        return ret;
     }
+
+    if (restored) {
+        if (had_previous_timeout) {
+            (void) setsockopt(
+                nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &previous_timeout, previous_timeout_len);
+        } else {
+            struct timeval block_forever = {.tv_sec = 0, .tv_usec = 0};
+            (void) setsockopt(
+                nl_socket_get_fd(connection->socket), SOL_SOCKET, SO_RCVTIMEO, &block_forever, sizeof(block_forever));
+        }
+    }
+
     return 0;
+}
+
+int umdp_receive_interrupt(umdp_connection* connection, uint32_t* out) {
+    return umdp_receive_interrupt_internal(connection, out, false, 0u, false);
+}
+
+int umdp_receive_interrupt_timeout(umdp_connection* connection, uint32_t* out, uint32_t timeout_ms) {
+    return umdp_receive_interrupt_internal(connection, out, true, timeout_ms, false);
+}
+
+int umdp_receive_interrupt_nowait(umdp_connection* connection, uint32_t* out) {
+    return umdp_receive_interrupt_internal(connection, out, false, 0u, true);
 }
 
 int umdp_mmap_physical(umdp_connection* connection, off_t start, size_t size, void** out) {

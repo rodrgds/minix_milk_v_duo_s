@@ -133,12 +133,34 @@ UMDP_PUBLIC int umdp_interrupt_subscribe(umdp_connection* connection, uint32_t i
 /// \return 0 in case of success, a non-zero value in case of failure
 UMDP_PUBLIC int umdp_interrupt_unsubscribe(umdp_connection* connection, uint32_t irq);
 
+/// Unmask interrupts from the specified IRQ line.
+///
+/// \param connection `umdp_connection` to use
+/// \param irq IRQ line to unmask
+/// \return 0 in case of success, a non-zero value in case of failure
+UMDP_PUBLIC int umdp_interrupt_unmask(umdp_connection* connection, uint32_t irq);
+
 /// Receive an interrupt notification from any of the subscribed IRQ lines.
 ///
 /// \param connection `umdp_connection` to use
 /// \param out Pointer to where the IRQ number should be stored
 /// \return 0 in case of success, a non-zero value in case of failure
 UMDP_PUBLIC int umdp_receive_interrupt(umdp_connection* connection, uint32_t* out);
+
+/// Receive an interrupt notification with timeout.
+///
+/// \\param connection `umdp_connection` to use
+/// \\param out Pointer to where the IRQ number should be stored
+/// \\param timeout_ms Timeout in milliseconds
+/// \\return 0 on success, ETIMEDOUT when no IRQ arrives before timeout, or another non-zero error code
+UMDP_PUBLIC int umdp_receive_interrupt_timeout(umdp_connection* connection, uint32_t* out, uint32_t timeout_ms);
+
+/// Try to receive an interrupt notification without blocking.
+///
+/// \\param connection `umdp_connection` to use
+/// \\param out Pointer to where the IRQ number should be stored
+/// \\return 0 on success, EAGAIN if no IRQ is currently queued, or another non-zero error code
+UMDP_PUBLIC int umdp_receive_interrupt_nowait(umdp_connection* connection, uint32_t* out);
 
 
 /// Establish a mapping between a physical memory region and the process's address space.
