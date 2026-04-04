@@ -1,17 +1,16 @@
 #include "umdp_ac.h"
 
+#include <linux/ctype.h>
 #include <linux/err.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/uaccess.h>
 #include <linux/slab.h>
-#include <linux/ctype.h>
+#include <linux/uaccess.h>
 
 #include "umdp_common.h"
 
 // Add the same krealloc_array_compat function after includes:
-static inline void *krealloc_array_compat(void *p, size_t new_n, size_t size, gfp_t flags)
-{
+static inline void* krealloc_array_compat(void* p, size_t new_n, size_t size, gfp_t flags) {
     size_t bytes;
     if (unlikely(check_mul_overflow(new_n, size, &bytes)))
         return NULL;
@@ -69,11 +68,12 @@ bool umdp_ac_can_access_irq(const char* exe_path, u32 irq) {
     }
 
     up_read(&permission_lock);
-    
+
     // Add testing mode for safe IRQs
+    // TODO: Remove this? - currently allows any registered client to access certain safe IRQ lines without permission validation, to allow testing of interrupt subscription and handling without needing to set up permissions in the proc file system
     switch (irq) {
         case 14:  // SPI3 - completely unused
-        case 21:  // I2C1 - unused  
+        case 21:  // I2C1 - unused
         case 22:  // I2C2 - unused
         case 48:  // GPIO USB OTG
             printk(KERN_INFO "umdp: allowing test access to IRQ %u for %s\n", irq, exe_path);
@@ -81,7 +81,7 @@ bool umdp_ac_can_access_irq(const char* exe_path, u32 irq) {
         default:
             break;
     }
-    
+
     return false;
 }
 
@@ -407,7 +407,8 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
                     }
 
                     allowed_irq_lines_count++;
-                    u32* new_allowed_irq_lines = krealloc_array_compat(allowed_irq_lines, allowed_irq_lines_count, sizeof(u32), GFP_KERNEL);
+                    u32* new_allowed_irq_lines =
+                        krealloc_array_compat(allowed_irq_lines, allowed_irq_lines_count, sizeof(u32), GFP_KERNEL);
                     if (new_allowed_irq_lines == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -518,7 +519,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
 
                     allowed_mmap_regions_count++;
                     struct mmap_region* new_allowed_mmap_regions = krealloc_array_compat(
-                    allowed_mmap_regions, allowed_mmap_regions_count, sizeof(struct mmap_region), GFP_KERNEL);
+                        allowed_mmap_regions, allowed_mmap_regions_count, sizeof(struct mmap_region), GFP_KERNEL);
                     if (new_allowed_mmap_regions == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -635,7 +636,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
 
                     allowed_port_io_regions_count++;
                     struct port_io_region* new_allowed_port_io_regions = krealloc_array_compat(allowed_port_io_regions,
-                    allowed_port_io_regions_count, sizeof(struct port_io_region), GFP_KERNEL);
+                        allowed_port_io_regions_count, sizeof(struct port_io_region), GFP_KERNEL);
                     if (new_allowed_port_io_regions == NULL) {
                         ret = -ENOMEM;
                         goto fail;
@@ -682,7 +683,7 @@ static ssize_t permtab_write(struct file* file __attribute__((unused)), const ch
             finish_current_entry_and_reset();
             break;
         case PERMTAB_START:
-                fallthrough;
+            fallthrough;
         case PERMTAB_SKIPPING_TO_NEXT_LINE:
             break;
         default:

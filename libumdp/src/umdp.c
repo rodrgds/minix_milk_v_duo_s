@@ -20,10 +20,12 @@
 #include "protocol-family.h"
 #include "protocol.h"
 
+// TODO: Re-enable netlink message validation - currently accepts any incoming message without content checks
 static int umdp_allow_any_msg_in(__attribute__((unused)) struct nl_msg* msg, __attribute__((unused)) void* arg) {
     return NL_OK;
 }
 
+// TODO: Re-enable netlink sequence number checking - currently disabled, vulnerable to message spoofing/replay attacks
 static int umdp_allow_any_seq(__attribute__((unused)) struct nl_msg* msg, __attribute__((unused)) void* arg) {
     return NL_OK;
 }
@@ -91,14 +93,17 @@ umdp_connection* umdp_connect(void) {
     }
 
     nl_socket_set_local_port(connection->socket, (uint32_t) getpid());
+    // TODO: Re-enable sequence number validation - currently disabled for testing
     nl_socket_disable_seq_check(connection->socket);
 
+    // TODO: Re-enable strict message-in validation - currently accepts any netlink message
     ret = nl_socket_modify_cb(connection->socket, NL_CB_MSG_IN, NL_CB_CUSTOM, umdp_allow_any_msg_in, NULL);
     if (ret != 0) {
-        printf_err("failed to relax incoming message checks: %s\n", nl_geterror(ret));
+        print_err("failed to allocate socket\n");
         goto failure;
     }
 
+    // TODO: Re-enable sequence check validation - currently bypassed with permissive callback
     ret = nl_socket_modify_cb(connection->socket, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, umdp_allow_any_seq, NULL);
     if (ret != 0) {
         printf_err("failed to relax sequence checks: %s\n", nl_geterror(ret));

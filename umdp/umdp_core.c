@@ -230,6 +230,7 @@ static u8 riscv_hardware_read_u8(u64 port) {
             value = ioread8(addr);
             printk(KERN_INFO "umdp: read GPIO0[0x04]: 0x%02x (port 0x61)\n", value);
             break;
+
             
         case 0x64:  // PS/2 keyboard command -> GPIO1 data register
             if (!gpio1_base) return 0xFF;
@@ -299,6 +300,7 @@ static void riscv_hardware_write_u8(u64 port, u8 value) {
             iowrite8(value, addr);
             printk(KERN_INFO "umdp: wrote 0x%02x to GPIO0[0x04] (port 0x61)\n", value);
             break;
+
             
         case 0x64:  // PS/2 keyboard command -> GPIO1 data register
             if (!gpio1_base) return;
@@ -934,6 +936,7 @@ static struct client_info* get_client_info_by_netlink_port_id(u32 port_id) {
     return NULL;
 }
 
+// TODO: Replace fragile kernel struct reinterpretation with a stable API - relies on assumed memory layout of private kernel struct netlink_sock which may break across kernel versions
 // `struct netlink_sock` is defined in `net/netlink/af_netlink.h` in the kernel source code, which isn't part of the "public" headers.
 // However, we need to access the portid.
 // The following is an evil hack, pray that the alignment matches the original struct.
@@ -1312,9 +1315,7 @@ static int umdp_devio_request(struct sk_buff* skb, struct genl_info* info) {
         return -EPERM;
     }
 
-    // Replace the access control check with this bypass:
-
-    // TEMPORARY BYPASS FOR TESTING - REMOVE AFTER CONFIRMING FUNCTIONALITY
+    // TODO: Re-enable I/O port access control check - currently bypassed for testing, allows any registered client to access any I/O port region without permission validation
     printk(KERN_INFO "umdp: BYPASSING access control - allowing %s to access region %llu-%llu\n", 
        this_client_info->exe_path, region.start, region.start + region.size - 1);
 
@@ -1796,7 +1797,7 @@ static int umdp_mem_mmap(struct file* file __attribute__((unused)), struct vm_ar
         return -EPERM;
     }
     
-    // TEMPORARY BYPASS FOR TESTING - REMOVE AFTER CONFIRMING FUNCTIONALITY
+    // TODO: Re-enable mmap access control check - currently bypassed for testing, allows any client to mmap any physical memory range without restriction
     printk(KERN_INFO "umdp: BYPASSING access control - allowing %s to mmap region 0x%lx-0x%lx\n", 
            exe_path, physical_start_addr, physical_end_addr);
            
@@ -1836,6 +1837,11 @@ static int __init umdp_init(void) {
     int ret = umdp_ac_init();
     if (ret != 0) {
         goto fail;
+    }
+
+    ret = umdp_init_hardware();
+    if (ret != 0) {
+        goto fail_after_ac_init;
     }
 
     ret = alloc_chrdev_region(&umdp_mem_chrdev, 0, 1, UMDP_MEM_DEVICE_NAME);
@@ -1933,6 +1939,7 @@ fail_after_cdev_init:
     cdev_del(&umdp_mem_cdev);
     unregister_chrdev_region(umdp_mem_chrdev, 1);
 fail_after_ac_init:
+    umdp_cleanup_hardware();
     umdp_ac_exit();
 fail:
     return ret;
@@ -1968,6 +1975,7 @@ static void __exit umdp_exit(void) {
     }
     up_write(&client_info_lock);
 
+    umdp_cleanup_hardware();
     umdp_ac_exit();
 }
 
